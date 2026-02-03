@@ -1,6 +1,6 @@
-# AutoTune Live
+# AutoTune
 
-AutoTune Live automatically generates tuning recommendations based on wideband O2 sensor feedback.
+AutoTune automatically generates tuning recommendations based on wideband O2 sensor feedback.
 
 ## Overview
 
@@ -15,10 +15,18 @@ AutoTune monitors your engine in real-time and suggests VE table corrections to 
 ## Starting AutoTune
 
 1. Connect to your ECU
-2. Go to **Tools → AutoTune Live** or press `Ctrl+Shift+A`
+2. Go to **Tools → AutoTune** or press `Ctrl+Shift+A`
 3. Select the table to tune (usually VE Table 1)
 4. Configure settings
 5. Click **Start**
+
+## Getting Started
+
+New to AutoTune? Start with the [Usage Guide](./autotune/usage-guide.md) for step-by-step instructions covering:
+- Before you start (prerequisites and safety)
+- Complete session workflow (from setup to applying changes)
+- Real-world examples (NA, turbocharged, E85 engines)
+- Troubleshooting common issues
 
 ## AutoTune Interface
 

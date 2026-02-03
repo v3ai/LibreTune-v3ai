@@ -7,6 +7,7 @@
 - [Installation](./getting-started/installation.md)
 - [Creating Your First Project](./getting-started/first-project.md)
 - [Connecting to Your ECU](./getting-started/connecting.md)
+- [Settings & Preferences](./getting-started/settings.md)
 
 # Core Features
 
@@ -14,7 +15,8 @@
   - [2D Tables](./features/table-editing/2d-tables.md)
   - [3D Visualization](./features/table-editing/3d-visualization.md)
   - [Keyboard Shortcuts](./features/table-editing/shortcuts.md)
-- [AutoTune Live](./features/autotune.md)
+- [AutoTune](./features/autotune.md)
+  - [Usage Guide](./features/autotune/usage-guide.md)
   - [Setting Up AutoTune](./features/autotune/setup.md)
   - [Understanding Recommendations](./features/autotune/recommendations.md)
   - [Filters and Authority](./features/autotune/filters.md)
@@ -23,6 +25,9 @@
   - [Customizing Gauges](./features/dashboards/customizing.md)
   - [Creating Dashboards](./features/dashboards/creating.md)
 - [Data Logging](./features/datalog.md)
+- [Performance Calculator](./features/performance-calculator.md)
+- [Diagnostic Loggers](./features/diagnostic-loggers.md)
+- [Tools](./features/tools.md)
 
 # Project Management
 

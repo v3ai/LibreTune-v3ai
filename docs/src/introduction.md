@@ -27,7 +27,7 @@ Edit 2D and 3D tables with professional tools:
 - Re-bin tables with automatic Z-value interpolation
 - 3D visualization for better understanding
 
-### AutoTune Live
+### AutoTune
 Automatically adjust VE and other tables based on wideband O2 sensor feedback:
 - Real-time recommendations with authority limits
 - Transient filtering to ignore bad data

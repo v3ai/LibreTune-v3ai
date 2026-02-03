@@ -18,7 +18,7 @@ All notable changes to LibreTune will be documented in this file.
 
 ### Fixed
 - Table operations (scale, smooth, interpolate) now properly connected to backend
-- AutoTune Live table lookup for rusEFI/epicEFI INIs
+- AutoTune table lookup for rusEFI/epicEFI INIs
 
 ## [0.1.0] - 2026-01-01
 
@@ -28,7 +28,7 @@ All notable changes to LibreTune will be documented in this file.
 - INI definition file parsing
 - Table editing (2D/3D)
 - Real-time dashboard with customizable gauges
-- AutoTune Live with AFR-based VE correction
+- AutoTune with AFR-based VE correction
 - Data logging and playback
 - TunerStudio project import
 - Restore points system

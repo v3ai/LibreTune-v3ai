@@ -1,6 +1,6 @@
 # Setting Up AutoTune
 
-Detailed configuration guide for AutoTune Live.
+Detailed configuration guide for AutoTune.
 
 ## Prerequisites
 
