@@ -6251,6 +6251,125 @@ async fn unlock_autotune_cells(
     Ok(())
 }
 
+/// Get AI-predicted VE values for cells with no AutoTune data.
+///
+/// Uses bilinear interpolation and neighbor-weighted averaging to predict
+/// VE values for zero-hit cells, with confidence scores.
+///
+/// # Arguments
+/// * `table_name` - Target VE table name
+/// * `min_confidence` - Minimum confidence threshold (0.0-1.0, default 0.3)
+/// * `min_hit_count` - Minimum hit count to consider a cell "known" (default 3)
+///
+/// Returns: Vector of predicted cells sorted by confidence
+#[tauri::command]
+async fn get_predicted_fills(
+    state: tauri::State<'_, AppState>,
+    table_name: String,
+    min_confidence: Option<f64>,
+    min_hit_count: Option<u32>,
+) -> Result<Vec<libretune_core::autotune::predictor::PredictedCell>, String> {
+    use libretune_core::autotune::predictor::{PredictorConfig, VePredictor};
+
+    // Get table data
+    let table_data = get_table_data_internal(&state, &table_name).await?;
+
+    // Use z_values directly (already 2D: Vec<Vec<f64>>)
+    let table_values = &table_data.z_values;
+    let rows = table_values.len();
+    let cols = if rows > 0 { table_values[0].len() } else { 0 };
+
+    // Get hit counts from AutoTune state
+    let at_guard = state.autotune_state.lock().await;
+    let recs = at_guard.get_recommendations();
+    let mut hit_counts = vec![vec![0u32; cols]; rows];
+    for rec in &recs {
+        if rec.cell_y < rows && rec.cell_x < cols {
+            hit_counts[rec.cell_y][rec.cell_x] = rec.hit_count;
+        }
+    }
+    drop(at_guard);
+
+    let config = PredictorConfig {
+        min_confidence: min_confidence.unwrap_or(0.3),
+        min_hit_count: min_hit_count.unwrap_or(3),
+        ..Default::default()
+    };
+
+    let predictor = VePredictor::new(config);
+
+    Ok(predictor.predict_cells(table_values, &hit_counts, &table_data.x_bins, &table_data.y_bins))
+}
+
+/// Detect anomalies in a VE/fuel table.
+///
+/// Runs statistical analysis to find outliers, monotonicity violations,
+/// gradient discontinuities, physically unreasonable values, and flat regions.
+///
+/// # Arguments
+/// * `table_name` - Target table name
+/// * `outlier_sigma` - Standard deviations for outlier detection (default 2.0)
+///
+/// Returns: Vector of detected anomalies sorted by severity
+#[tauri::command]
+async fn get_tune_anomalies(
+    state: tauri::State<'_, AppState>,
+    table_name: String,
+    outlier_sigma: Option<f64>,
+) -> Result<Vec<libretune_core::autotune::anomaly::TuneAnomaly>, String> {
+    use libretune_core::autotune::anomaly::{AnomalyConfig, AnomalyDetector};
+
+    let table_data = get_table_data_internal(&state, &table_name).await?;
+
+    let config = AnomalyConfig {
+        outlier_sigma: outlier_sigma.unwrap_or(2.0),
+        ..Default::default()
+    };
+
+    let detector = AnomalyDetector::new(config);
+
+    Ok(detector.detect_anomalies(&table_data.z_values, &table_data.x_bins, &table_data.y_bins))
+}
+
+/// Get a tune health report scoring the VE table by region.
+///
+/// Evaluates idle, cruise, WOT, and part-throttle regions for coverage,
+/// smoothness, and monotonicity. Returns overall grade (A-F) and
+/// per-region scores with actionable recommendations.
+///
+/// # Arguments
+/// * `table_name` - Target VE table name
+///
+/// Returns: Complete health report with scores and recommendations
+#[tauri::command]
+async fn get_tune_health_report(
+    state: tauri::State<'_, AppState>,
+    table_name: String,
+) -> Result<libretune_core::autotune::health::TuneHealthReport, String> {
+    use libretune_core::autotune::health::{HealthConfig, HealthScorer};
+
+    let table_data = get_table_data_internal(&state, &table_name).await?;
+
+    let table_values = &table_data.z_values;
+    let rows = table_values.len();
+    let cols = if rows > 0 { table_values[0].len() } else { 0 };
+
+    // Get hit counts from AutoTune state
+    let at_guard = state.autotune_state.lock().await;
+    let recs = at_guard.get_recommendations();
+    let mut hit_counts = vec![vec![0u32; cols]; rows];
+    for rec in &recs {
+        if rec.cell_y < rows && rec.cell_x < cols {
+            hit_counts[rec.cell_y][rec.cell_x] = rec.hit_count;
+        }
+    }
+    drop(at_guard);
+
+    let scorer = HealthScorer::new(HealthConfig::default());
+
+    Ok(scorer.score_table(table_values, &hit_counts, &table_data.x_bins, &table_data.y_bins))
+}
+
 /// Helper function to get table data internally (avoids code duplication)
 async fn get_table_data_internal(
     state: &tauri::State<'_, AppState>,
@@ -13345,6 +13464,9 @@ pub fn run() {
             burn_autotune_recommendations,
             lock_autotune_cells,
             unlock_autotune_cells,
+            get_predicted_fills,
+            get_tune_anomalies,
+            get_tune_health_report,
             rebin_table,
             smooth_table,
             interpolate_cells,

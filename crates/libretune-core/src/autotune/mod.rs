@@ -7,6 +7,15 @@
 //! - Data filtering (RPM ranges, coolant temp, custom expressions)
 //! - Cell locking functionality
 //! - Reference tables (Lambda Delay, AFR Target)
+//!
+//! AI Analysis submodules:
+//! - Predictive cell filling for zero-hit VE table cells
+//! - Anomaly detection for identifying suspect data and tune problems
+//! - Tune health scoring with per-region quality assessment
+
+pub mod anomaly;
+pub mod health;
+pub mod predictor;
 
 use evalexpr::{eval_with_context, ContextWithMutableVariables, HashMapContext, Value};
 use serde::{Deserialize, Serialize};

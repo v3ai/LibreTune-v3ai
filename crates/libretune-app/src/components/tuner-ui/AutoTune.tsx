@@ -32,6 +32,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { valueToHeatmapColor } from '../../utils/heatmapColors';
+import { TuneHealthCard } from './TuneHealth';
 import './AutoTune.css';
 
 // =============================================================================
@@ -794,6 +795,9 @@ export function AutoTune({ tableName: initialTableName = '', onClose }: AutoTune
               </div>
             </div>
           )}
+
+          {/* AI Tune Health */}
+          {selectedTable && <TuneHealthCard tableName={selectedTable} />}
 
           {/* Settings */}
           <div className="autotune-settings-section">
