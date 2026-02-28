@@ -9037,33 +9037,57 @@ async fn start_tooth_logger(
 
     if signature.contains("speeduino") || signature.contains("202") {
         // Speeduino protocol: Send 'H' command for tooth log
-        // Response: 2-byte count + (count * 4-byte entries)
-        // Each entry: 2 bytes tooth number + 2 bytes time (in 0.5us units)
+        // Response format: 2-byte count (little-endian) + (count * 4-byte entries)
+        // Each entry: 2 bytes tooth number (LE) + 2 bytes time in 0.5µs units (LE)
         eprintln!("[Tooth Logger] Starting Speeduino tooth capture...");
 
-        // Send the tooth log request command
-        conn.send_raw_bytes(b"H")
-            .map_err(|e| format!("Failed to send tooth log command: {}", e))?;
+        let response = conn
+            .send_raw_bytes_with_response(b"H", std::time::Duration::from_millis(2000))
+            .map_err(|e| format!("Failed to get tooth log data: {}", e))?;
 
-        // Wait for ECU to capture data
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if response.len() < 2 {
+            return Err("Tooth logger returned no data (ECU may not support this command)".into());
+        }
 
-        // Read response (ECU captures ~512 teeth then returns)
-        // For now, return simulated data as placeholder until full protocol implementation
-        teeth = (0..36)
-            .map(|i| ToothLogEntry {
-                tooth_number: i,
-                tooth_time_us: 3000 + (i as u32 * 10), // ~3ms per tooth at idle
-                crank_angle: Some(i as f32 * 10.0),
+        // Parse 2-byte tooth count
+        let tooth_count = u16::from_le_bytes([response[0], response[1]]) as usize;
+        eprintln!("[Tooth Logger] ECU reports {} teeth", tooth_count);
+
+        let expected_len = 2 + tooth_count * 4;
+        if response.len() < expected_len {
+            eprintln!(
+                "[Tooth Logger] Warning: expected {} bytes but got {}. Parsing available data.",
+                expected_len,
+                response.len()
+            );
+        }
+
+        let available_teeth = (response.len().saturating_sub(2)) / 4;
+        let parse_count = available_teeth.min(tooth_count);
+
+        teeth = (0..parse_count)
+            .map(|i| {
+                let offset = 2 + i * 4;
+                let tooth_num = u16::from_le_bytes([response[offset], response[offset + 1]]);
+                // Time is in 0.5µs units, convert to µs
+                let raw_time = u16::from_le_bytes([response[offset + 2], response[offset + 3]]);
+                let tooth_time_us = raw_time as u32 / 2;
+                ToothLogEntry {
+                    tooth_number: tooth_num,
+                    tooth_time_us,
+                    crank_angle: None, // Speeduino doesn't provide angle in this response
+                }
             })
             .collect();
 
-        eprintln!("[Tooth Logger] Captured {} teeth", teeth.len());
+        eprintln!("[Tooth Logger] Parsed {} teeth from response", teeth.len());
     } else if signature.contains("rusefi") || signature.contains("fome") {
         // rusEFI protocol: Binary commands
         // 'l\x01' = start tooth logger
         // 'l\x02' = get tooth data
         // 'l\x03' = stop tooth logger
+        // Response to 'l\x02': 2-byte count (BE) + (count * 4-byte entries)
+        // Each entry: 4 bytes time in µs (big-endian, u32)
         eprintln!("[Tooth Logger] Starting rusEFI tooth capture...");
 
         // Start logger
@@ -9074,35 +9098,75 @@ async fn start_tooth_logger(
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // Get data
-        conn.send_raw_bytes(&[b'l', 0x02])
+        let response = conn
+            .send_raw_bytes_with_response(&[b'l', 0x02], std::time::Duration::from_millis(2000))
             .map_err(|e| format!("Failed to get tooth data: {}", e))?;
 
         // Stop logger
-        conn.send_raw_bytes(&[b'l', 0x03])
-            .map_err(|e| format!("Failed to stop tooth logger: {}", e))?;
+        let _ = conn.send_raw_bytes(&[b'l', 0x03]);
 
-        // For now, return simulated data
-        teeth = (0..60)
-            .map(|i| ToothLogEntry {
-                tooth_number: i,
-                tooth_time_us: 1600 + (i as u32 * 5),
-                crank_angle: Some(i as f32 * 6.0),
+        if response.len() < 2 {
+            return Err("Tooth logger returned no data".into());
+        }
+
+        // rusEFI uses big-endian 2-byte count
+        let tooth_count = u16::from_be_bytes([response[0], response[1]]) as usize;
+        eprintln!("[Tooth Logger] ECU reports {} teeth", tooth_count);
+
+        let available_teeth = (response.len().saturating_sub(2)) / 4;
+        let parse_count = available_teeth.min(tooth_count);
+
+        teeth = (0..parse_count)
+            .map(|i| {
+                let offset = 2 + i * 4;
+                let tooth_time_us = u32::from_be_bytes([
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                ]);
+                ToothLogEntry {
+                    tooth_number: i as u16,
+                    tooth_time_us,
+                    crank_angle: None,
+                }
             })
             .collect();
+
+        eprintln!("[Tooth Logger] Parsed {} teeth from response", teeth.len());
     } else if signature.contains("ms2") || signature.contains("ms3") || signature.contains("mega") {
-        // Megasquirt protocol: Page fetch
+        // Megasquirt protocol: Read tooth log page
+        // MS2/MS3 uses page 0xF0 for tooth log data
+        // Response: raw bytes, each 2-byte pair is tooth time in µs (big-endian)
         eprintln!("[Tooth Logger] Starting Megasquirt tooth capture...");
 
-        // MS2/MS3 uses page 0xf0 for tooth logger data
-        // Would need to fetch page and parse tooth timing data
+        let response = conn
+            .read_page(0xF0)
+            .map_err(|e| format!("Failed to read tooth log page: {}", e))?;
 
-        teeth = (0..36)
-            .map(|i| ToothLogEntry {
-                tooth_number: i,
-                tooth_time_us: 2800 + (i as u32 * 8),
-                crank_angle: Some(i as f32 * 10.0),
+        if response.is_empty() {
+            return Err("Tooth logger returned no data".into());
+        }
+
+        // MS tooth log: each entry is 2 bytes (big-endian), tooth time in µs
+        let tooth_count = response.len() / 2;
+        teeth = (0..tooth_count)
+            .filter_map(|i| {
+                let offset = i * 2;
+                let raw_time = u16::from_be_bytes([response[offset], response[offset + 1]]);
+                // Skip zero entries (unused slots)
+                if raw_time == 0 {
+                    return None;
+                }
+                Some(ToothLogEntry {
+                    tooth_number: i as u16,
+                    tooth_time_us: raw_time as u32,
+                    crank_angle: None,
+                })
             })
             .collect();
+
+        eprintln!("[Tooth Logger] Parsed {} teeth from response", teeth.len());
     } else {
         // Unknown ECU - return placeholder indicating feature not available
         return Err(format!(
@@ -9181,8 +9245,13 @@ async fn start_composite_logger(
     if signature.contains("speeduino") || signature.contains("202") {
         // Speeduino composite logger commands:
         // 'J' = Start composite logger
-        // 'O' = Get composite data
-        // 'X' = Stop composite logger (or just timeout)
+        // 'O' = Get composite data  
+        // 'X' = Stop composite logger
+        // Response to 'O': Raw bytes, each entry is 1 byte of packed flags:
+        //   bit 0: primary trigger state
+        //   bit 1: secondary trigger state
+        //   bit 2: sync status
+        // Entries are captured at ~10kHz (100µs intervals)
         eprintln!("[Composite Logger] Starting Speeduino composite capture...");
 
         conn.send_raw_bytes(b"J")
@@ -9190,21 +9259,39 @@ async fn start_composite_logger(
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        conn.send_raw_bytes(b"O")
+        let response = conn
+            .send_raw_bytes_with_response(b"O", std::time::Duration::from_millis(2000))
             .map_err(|e| format!("Failed to get composite data: {}", e))?;
 
-        // Simulated data for now
-        entries = (0..1000)
-            .map(|i| CompositeLogEntry {
-                time_us: i * 100, // 100us sample rate = 10kHz
-                primary: (i / 10) % 2 == 0,
-                secondary: (i / 100) % 2 == 0,
-                sync: i >= 100, // Sync after first cam pulse
+        if response.is_empty() {
+            return Err("Composite logger returned no data".into());
+        }
+
+        // Each byte is a packed status entry at ~100µs intervals
+        entries = response
+            .iter()
+            .enumerate()
+            .map(|(i, &byte)| CompositeLogEntry {
+                time_us: (i as u32) * 100, // 100µs per sample = 10kHz
+                primary: (byte & 0x01) != 0,
+                secondary: (byte & 0x02) != 0,
+                sync: (byte & 0x04) != 0,
                 voltage: None,
             })
             .collect();
+
+        // Send stop
+        let _ = conn.send_raw_bytes(b"X");
+
+        eprintln!(
+            "[Composite Logger] Parsed {} entries from response",
+            entries.len()
+        );
     } else if signature.contains("rusefi") || signature.contains("fome") {
         // rusEFI: 'l\x04' start, 'l\x05' get, 'l\x06' stop
+        // Response to 'l\x05': 2-byte count (BE) + (count * 5-byte entries)
+        // Each entry: 4 bytes time_us (BE u32) + 1 byte flags
+        //   flags bit 0: primary, bit 1: secondary, bit 2: sync
         eprintln!("[Composite Logger] Starting rusEFI composite capture...");
 
         conn.send_raw_bytes(&[b'l', 0x04])
@@ -9212,34 +9299,91 @@ async fn start_composite_logger(
 
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        conn.send_raw_bytes(&[b'l', 0x05])
+        let response = conn
+            .send_raw_bytes_with_response(&[b'l', 0x05], std::time::Duration::from_millis(2000))
             .map_err(|e| format!("Failed to get composite data: {}", e))?;
 
-        conn.send_raw_bytes(&[b'l', 0x06])
-            .map_err(|e| format!("Failed to stop composite logger: {}", e))?;
+        let _ = conn.send_raw_bytes(&[b'l', 0x06]);
 
-        entries = (0..2000)
-            .map(|i| CompositeLogEntry {
-                time_us: i * 50, // 50us sample rate = 20kHz
-                primary: (i / 8) % 2 == 0,
-                secondary: (i / 80) % 2 == 0,
-                sync: i >= 80,
-                voltage: Some(2.5 + if (i / 8) % 2 == 0 { 2.0 } else { 0.0 }),
+        if response.len() < 2 {
+            return Err("Composite logger returned no data".into());
+        }
+
+        let entry_count = u16::from_be_bytes([response[0], response[1]]) as usize;
+        let available = (response.len().saturating_sub(2)) / 5;
+        let parse_count = available.min(entry_count);
+
+        entries = (0..parse_count)
+            .map(|i| {
+                let offset = 2 + i * 5;
+                let time_us = u32::from_be_bytes([
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                ]);
+                let flags = response[offset + 4];
+                CompositeLogEntry {
+                    time_us,
+                    primary: (flags & 0x01) != 0,
+                    secondary: (flags & 0x02) != 0,
+                    sync: (flags & 0x04) != 0,
+                    voltage: None,
+                }
             })
             .collect();
+
+        eprintln!(
+            "[Composite Logger] Parsed {} entries from response",
+            entries.len()
+        );
     } else if signature.contains("ms2") || signature.contains("ms3") || signature.contains("mega") {
-        // Megasquirt: Page 0xf2-0xf3 for composite
+        // Megasquirt: Page 0xF2 for composite log data
+        // Response: raw bytes, each entry is 6 bytes:
+        //   4 bytes time_us (BE u32), 1 byte flags, 1 byte voltage (0-255 mapped to 0-5V)
         eprintln!("[Composite Logger] Starting Megasquirt composite capture...");
 
-        entries = (0..500)
-            .map(|i| CompositeLogEntry {
-                time_us: i * 200,
-                primary: (i / 15) % 2 == 0,
-                secondary: (i / 150) % 2 == 0,
-                sync: i >= 30,
-                voltage: None,
+        let response = conn
+            .read_page(0xF2)
+            .map_err(|e| format!("Failed to read composite log page: {}", e))?;
+
+        if response.is_empty() {
+            return Err("Composite logger returned no data".into());
+        }
+
+        let entry_count = response.len() / 6;
+        entries = (0..entry_count)
+            .filter_map(|i| {
+                let offset = i * 6;
+                if offset + 5 >= response.len() {
+                    return None;
+                }
+                let time_us = u32::from_be_bytes([
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                ]);
+                // Skip zero-time entries (unused)
+                if time_us == 0 {
+                    return None;
+                }
+                let flags = response[offset + 4];
+                let raw_voltage = response[offset + 5];
+                Some(CompositeLogEntry {
+                    time_us,
+                    primary: (flags & 0x01) != 0,
+                    secondary: (flags & 0x02) != 0,
+                    sync: (flags & 0x04) != 0,
+                    voltage: Some(raw_voltage as f32 * 5.0 / 255.0),
+                })
             })
             .collect();
+
+        eprintln!(
+            "[Composite Logger] Parsed {} entries from response",
+            entries.len()
+        );
     } else {
         return Err(format!(
             "Composite logger not supported for this ECU type (signature: {})",
@@ -9575,72 +9719,102 @@ async fn export_tune_as_csv(
 
     let mut csv_lines = Vec::new();
     csv_lines.push(
-        "Name,Page,Offset,Value,Units,Min,Max,Scale,Translate,DataType,IsPcVariable".to_string(),
+        "Name,Page,Offset,Shape,Value,Units,Min,Max,Scale,Translate,DataType,IsPcVariable"
+            .to_string(),
     );
 
     let mut export_count = 0u32;
 
     // Export all constants
     for (name, constant) in &def.constants {
-        // Skip arrays for now (they need special handling)
-        if !matches!(constant.shape, libretune_core::ini::Shape::Scalar) {
-            continue;
-        }
-
-        // Get the current value
-        let value = if constant.is_pc_variable {
-            // PC variable - check local cache
-            if let Some(cache) = cache_guard.as_ref() {
-                if let Some(&val) = cache.local_values.get(name) {
-                    val
-                } else if let Some(&default_val) = def.default_values.get(name) {
-                    default_val
-                } else {
-                    constant.min
-                }
-            } else if let Some(&default_val) = def.default_values.get(name) {
-                default_val
+        // Get the current value(s)
+        let value_str = if constant.data_type == DataType::String {
+            // String constant — read raw bytes from cache/tune
+            let str_len = constant.size_bytes();
+            let raw = if let Some(cache) = cache_guard.as_ref() {
+                cache
+                    .read_bytes(constant.page, constant.offset, str_len as u16)
+                    .map(|b| b.to_vec())
             } else {
-                constant.min
-            }
-        } else if let Some(tune) = tune_guard.as_ref() {
-            // ECU constant - read from tune file
-            if let Some(tune_val) = tune.constants.get(name) {
-                match tune_val {
-                    TuneValue::Scalar(v) => *v,
-                    TuneValue::Bool(b) => {
-                        if *b {
-                            1.0
+                None
+            };
+            let raw = raw.or_else(|| {
+                tune_guard.as_ref().and_then(|tune| {
+                    tune.pages.get(&constant.page).and_then(|page_data| {
+                        let start = constant.offset as usize;
+                        let end = start + str_len;
+                        if end <= page_data.len() {
+                            Some(page_data[start..end].to_vec())
                         } else {
-                            0.0
+                            None
                         }
-                    }
-                    TuneValue::String(s) => {
-                        // Try to parse as number or look up in bit_options
-                        s.parse::<f64>().unwrap_or_else(|_| {
-                            constant
-                                .bit_options
-                                .iter()
-                                .position(|opt| opt == s)
-                                .map(|i| i as f64)
-                                .unwrap_or(0.0)
-                        })
-                    }
-                    TuneValue::Array(arr) => arr.first().copied().unwrap_or(0.0),
-                }
+                    })
+                })
+            });
+            if let Some(bytes) = raw {
+                // Trim null padding
+                let s = String::from_utf8_lossy(&bytes);
+                let trimmed = s.trim_end_matches('\0');
+                format!("\"{}\"", trimmed.replace('"', "\"\""))
             } else {
-                // Not in tune file - use default
-                def.default_values
-                    .get(name)
-                    .copied()
-                    .unwrap_or(constant.min)
+                "\"\"".to_string()
             }
+        } else if matches!(constant.shape, libretune_core::ini::Shape::Scalar) {
+            // Scalar constant
+            let value = read_constant_from_cache_or_tune(
+                name,
+                constant,
+                def.endianness,
+                tune_guard.as_ref(),
+                cache_guard.as_ref(),
+            );
+            format!("{}", value)
         } else {
-            // No tune loaded - use default
-            def.default_values
-                .get(name)
-                .copied()
-                .unwrap_or(constant.min)
+            // Array constant — read all elements
+            let elem_size = constant.data_type.size_bytes();
+            let elem_count = constant.shape.element_count();
+            let mut values = Vec::with_capacity(elem_count);
+
+            for idx in 0..elem_count {
+                let offset = constant.offset + (idx * elem_size) as u16;
+                let raw_bytes = if let Some(cache) = cache_guard.as_ref() {
+                    cache
+                        .read_bytes(constant.page, offset, elem_size as u16)
+                        .map(|b| b.to_vec())
+                } else {
+                    None
+                };
+                let raw_bytes = raw_bytes.or_else(|| {
+                    tune_guard.as_ref().and_then(|tune| {
+                        tune.pages.get(&constant.page).and_then(|page_data| {
+                            let start = offset as usize;
+                            let end = start + elem_size;
+                            if end <= page_data.len() {
+                                Some(page_data[start..end].to_vec())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                });
+                let raw_val = if let Some(bytes) = raw_bytes {
+                    constant
+                        .data_type
+                        .read_from_bytes(&bytes, 0, def.endianness)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                let display_val = constant.raw_to_display(raw_val);
+                values.push(format!("{}", display_val));
+            }
+            format!("\"[{}]\"", values.join(","))
+        };
+
+        let shape_str = match &constant.shape {
+            libretune_core::ini::Shape::Scalar => "scalar".to_string(),
+            libretune_core::ini::Shape::Array1D(n) => format!("[{}]", n),
+            libretune_core::ini::Shape::Array2D { rows, cols } => format!("[{}x{}]", rows, cols),
         };
 
         // Escape name and units for CSV (in case they contain commas)
@@ -9658,11 +9832,12 @@ async fn export_tune_as_csv(
         let data_type_str = format!("{:?}", constant.data_type);
 
         csv_lines.push(format!(
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
             escaped_name,
             constant.page,
             constant.offset,
-            value,
+            shape_str,
+            value_str,
             escaped_units,
             constant.min,
             constant.max,
@@ -9704,7 +9879,7 @@ async fn import_tune_from_csv(
 
     for (line_num, line) in csv_content.lines().enumerate() {
         // Skip header
-        if line_num == 0 && line.starts_with("Name,") {
+        if line_num == 0 && (line.starts_with("Name,") || line.starts_with("\"Name\"")) {
             continue;
         }
 
@@ -9715,19 +9890,87 @@ async fn import_tune_from_csv(
 
         // Parse CSV line (simple parser - handles basic quoting)
         let fields: Vec<&str> = parse_csv_line(line);
-        if fields.len() < 4 {
+
+        // Support both old format (11 cols: Name,Page,Offset,Value,...)
+        // and new format (12 cols: Name,Page,Offset,Shape,Value,...)
+        let (name, value_field) = if fields.len() >= 12 {
+            // New format with Shape column
+            (fields[0].trim(), fields[4].trim())
+        } else if fields.len() >= 4 {
+            // Legacy format without Shape column
+            (fields[0].trim(), fields[3].trim())
+        } else {
             errors.push(format!("Line {}: too few fields", line_num + 1));
+            continue;
+        };
+
+        // Find constant in definition
+        let constant = match def.constants.get(name) {
+            Some(c) => c,
+            None => {
+                // Constant not found - skip silently (might be from different INI)
+                continue;
+            }
+        };
+
+        // Handle string constants
+        if constant.data_type == DataType::String {
+            let str_val = value_field
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .replace("\"\"", "\"");
+            let max_len = constant.size_bytes();
+            let mut raw_data = vec![0u8; max_len];
+            let copy_len = str_val.len().min(max_len);
+            raw_data[..copy_len].copy_from_slice(&str_val.as_bytes()[..copy_len]);
+            cache.write_bytes(constant.page, constant.offset, &raw_data);
+            tune.constants
+                .insert(name.to_string(), TuneValue::String(str_val));
+            import_count += 1;
             continue;
         }
 
-        let name = fields[0].trim();
-        let value: f64 = match fields[3].trim().parse() {
+        // Handle array constants (value looks like "[1.0,2.0,3.0]")
+        if !matches!(constant.shape, libretune_core::ini::Shape::Scalar) {
+            let array_str = value_field
+                .trim_start_matches('"')
+                .trim_end_matches('"')
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+
+            let elem_size = constant.data_type.size_bytes();
+            let elem_count = constant.shape.element_count();
+            let values: Vec<f64> = array_str
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .collect();
+
+            let parse_count = values.len().min(elem_count);
+            for (idx, &display_val) in values.iter().take(parse_count).enumerate() {
+                let clamped = display_val.clamp(constant.min, constant.max);
+                let raw_val = constant.display_to_raw(clamped);
+                let offset = constant.offset + (idx * elem_size) as u16;
+                let mut bytes = vec![0u8; elem_size];
+                constant
+                    .data_type
+                    .write_to_bytes(&mut bytes, 0, raw_val, def.endianness);
+                cache.write_bytes(constant.page, offset, &bytes);
+            }
+
+            tune.constants
+                .insert(name.to_string(), TuneValue::Array(values));
+            import_count += 1;
+            continue;
+        }
+
+        // Scalar constant
+        let value: f64 = match value_field.parse() {
             Ok(v) => v,
             Err(_) => {
                 errors.push(format!(
                     "Line {}: invalid value '{}'",
                     line_num + 1,
-                    fields[3]
+                    value_field
                 ));
                 continue;
             }
@@ -12692,8 +12935,65 @@ async fn update_constant_string(
         return Err(format!("Constant {} is not a string type", name));
     }
 
-    // For now, string constants are just stored locally without ECU write
-    // In the future, we might need to handle ECU memory updates
+    let max_len = constant.size_bytes();
+    if max_len == 0 {
+        return Err(format!("String constant {} has zero length", name));
+    }
+
+    // Encode string to bytes: fixed-length, null-padded
+    let mut raw_data = vec![0u8; max_len];
+    let copy_len = value.len().min(max_len);
+    raw_data[..copy_len].copy_from_slice(&value.as_bytes()[..copy_len]);
+    // Remaining bytes are already 0 (null padding)
+
+    // Write to TuneCache if available
+    let mut cache_guard = state.tune_cache.lock().await;
+    if let Some(cache) = cache_guard.as_mut() {
+        cache.write_bytes(constant.page, constant.offset, &raw_data);
+    }
+
+    // Update TuneFile in memory
+    let mut tune_guard = state.current_tune.lock().await;
+    if let Some(tune) = tune_guard.as_mut() {
+        let page_data = tune.pages.entry(constant.page).or_insert_with(|| {
+            let def_guard_inner = &def;
+            vec![
+                0u8;
+                def_guard_inner
+                    .page_sizes
+                    .get(constant.page as usize)
+                    .copied()
+                    .unwrap_or(256) as usize
+            ]
+        });
+        let start = constant.offset as usize;
+        let end = start + raw_data.len();
+        if end <= page_data.len() {
+            page_data[start..end].copy_from_slice(&raw_data);
+        }
+        tune.constants.insert(
+            name.clone(),
+            libretune_core::tune::TuneValue::String(value.clone()),
+        );
+    }
+
+    // Mark tune as modified
+    *state.tune_modified.lock().await = true;
+
+    // Write to ECU if connected
+    let mut conn_guard = state.connection.lock().await;
+    if let Some(conn) = conn_guard.as_mut() {
+        let params = libretune_core::protocol::commands::WriteMemoryParams {
+            can_id: 0,
+            page: constant.page,
+            offset: constant.offset,
+            data: raw_data,
+        };
+        if let Err(e) = conn.write_memory(params) {
+            eprintln!("[WARN] Failed to write string constant to ECU: {}", e);
+        }
+    }
+
     eprintln!("Updated string constant '{}' to: '{}'", name, value);
 
     Ok(())

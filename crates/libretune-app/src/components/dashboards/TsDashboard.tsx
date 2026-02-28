@@ -13,39 +13,6 @@ import {
 
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useRealtimeStore, useChannelValue } from '../../stores/realtimeStore';
-
-/**
- * DataFlowIndicator — diagnostic that polls the store every 500ms (bypasses subscribe).
- * Shows whether data is reaching the store and when it last updated.
- * TODO: remove once gauge rendering is confirmed working.
- */
-function DataFlowIndicator() {
-  const [info, setInfo] = useState({ rpm: 0, keys: 0, lastUpdate: 0, age: 'never' });
-  useEffect(() => {
-    // Poll the store directly every 500ms — does NOT rely on subscribe() firing.
-    const interval = setInterval(() => {
-      const state = useRealtimeStore.getState();
-      const keys = Object.keys(state.channels);
-      const rpm = state.channels['rpm'] ?? state.channels['RPM'] ?? 0;
-      const lastUpdate = state.lastUpdateTime;
-      const ageMs = lastUpdate > 0 ? Date.now() - lastUpdate : -1;
-      const age = ageMs < 0 ? 'never' : ageMs < 1000 ? `${ageMs}ms` : `${(ageMs / 1000).toFixed(1)}s ago`;
-      setInfo({ rpm: Math.round(rpm), keys: keys.length, lastUpdate, age });
-      // Log when data gets stale
-      if (ageMs > 2000 && keys.length > 0) {
-        console.warn(`[DataFlow] STALE: last update ${(ageMs / 1000).toFixed(1)}s ago, ${keys.length} keys, rpm=${Math.round(rpm)}`);
-      }
-    }, 500);
-    return () => clearInterval(interval);
-  }, []);
-  if (info.keys === 0) return null;
-  const color = info.age === 'never' || info.age.includes('ago') ? '#f44' : '#0f0';
-  return (
-    <span style={{ fontSize: 11, color, fontFamily: 'monospace', marginLeft: 12, opacity: 0.8 }}>
-      [RPM: {info.rpm} | Keys: {info.keys} | Age: {info.age}]
-    </span>
-  );
-}
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { save } from '@tauri-apps/plugin-dialog';
@@ -944,7 +911,7 @@ export default function TsDashboard({ initialDashPath, isConnected = false }: Ts
           >
             Change ▼
           </button>
-          <DataFlowIndicator />
+
         </div>
         <div className="ts-dashboard-header-right">
           <button 

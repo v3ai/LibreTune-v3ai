@@ -1504,6 +1504,107 @@ impl Connection {
         self.send_raw_command_no_response(bytes)
     }
 
+    /// Send raw bytes to ECU and read back the response.
+    ///
+    /// Sends command bytes, waits up to `timeout` for the response, using an
+    /// inter-character timeout of 50ms to detect end of transmission.
+    /// Returns the raw response bytes.
+    pub fn send_raw_bytes_with_response(
+        &mut self,
+        bytes: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, ProtocolError> {
+        let baud_rate = self.config.baud_rate;
+        let min_wait = Some(self.get_effective_min_wait());
+
+        let channel = self.channel.as_mut().ok_or(ProtocolError::NotConnected)?;
+
+        // Clear buffers
+        let _ = channel.clear_input_buffer();
+
+        eprintln!(
+            "[DEBUG] send_raw_bytes_with_response: sending {} bytes: {:02x?}",
+            bytes.len(),
+            bytes
+        );
+
+        // Send command
+        write_and_wait(channel, bytes, baud_rate, min_wait)
+            .map_err(|e| ProtocolError::SerialError(e.to_string()))?;
+
+        // Read response with inter-character timeout detection
+        let mut response = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let start = Instant::now();
+        let mut last_data_time = Instant::now();
+        let inter_char_timeout = Duration::from_millis(50);
+
+        loop {
+            if start.elapsed() > timeout {
+                eprintln!(
+                    "[DEBUG] send_raw_bytes_with_response: overall timeout reached ({} bytes read)",
+                    response.len()
+                );
+                break;
+            }
+
+            // If we have data and haven't received more in inter_char_timeout, we're done
+            if !response.is_empty() && last_data_time.elapsed() > inter_char_timeout {
+                eprintln!(
+                    "[DEBUG] send_raw_bytes_with_response: inter-char timeout, done ({} bytes)",
+                    response.len()
+                );
+                break;
+            }
+
+            let available = match channel.bytes_to_read() {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!(
+                        "[DEBUG] send_raw_bytes_with_response: bytes_to_read error: {}",
+                        e
+                    );
+                    if !response.is_empty() {
+                        break;
+                    }
+                    return Err(ProtocolError::SerialError(e.to_string()));
+                }
+            };
+
+            if available > 0 {
+                let to_read = std::cmp::min(available as usize, buffer.len());
+                match channel.read(&mut buffer[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&buffer[..n]);
+                        last_data_time = Instant::now();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                        if !response.is_empty() {
+                            break;
+                        }
+                    }
+                    Err(e) => return Err(ProtocolError::SerialError(e.to_string())),
+                }
+            } else {
+                // No data available, brief sleep to avoid busy loop
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        self.rx_bytes = self.rx_bytes.saturating_add(response.len() as u64);
+        if !response.is_empty() {
+            self.rx_packets = self.rx_packets.saturating_add(1);
+        }
+
+        eprintln!(
+            "[DEBUG] send_raw_bytes_with_response: got {} bytes response",
+            response.len()
+        );
+
+        Ok(response)
+    }
+
     /// Send a text console command to the ECU (rusEFI/FOME/epicEFI only)
     /// Sends command followed by newline and reads back response until inter-char timeout
     /// Returns the response as a String (with trailing whitespace trimmed)
