@@ -29,7 +29,7 @@ import {
 import ConnectionMetrics from './components/layout/ConnectionMetrics';
 import OnboardingDialog from './components/dialogs/OnboardingDialog';
 import TsDashboard from "./components/dashboards/TsDashboard";
-import { ToothLoggerView, CompositeLoggerView } from "./components/diagnostics";
+import { ToothLoggerView, CompositeLoggerView, OutputChannelStatus } from "./components/diagnostics";
 import { EcuConsole } from "./components/console/EcuConsole";
 import { LuaConsole } from "./components/console/LuaConsole";
 import DialogRenderer, { DialogDefinition as RendererDialogDef } from "./components/dialogs/DialogRenderer";
@@ -262,7 +262,7 @@ interface PortEditorConfig {
 
 // Tab content types
 interface TabContent {
-  type: "dashboard" | "table" | "curve" | "dialog" | "portEditor" | "settings" | "project" | "autotune" | "datalog" | "tooth-logger" | "composite-logger" | "console" | "lua-console";
+  type: "dashboard" | "table" | "curve" | "dialog" | "portEditor" | "settings" | "project" | "autotune" | "datalog" | "tooth-logger" | "composite-logger" | "console" | "lua-console" | "och-status";
   data?: TunerTableData | RendererDialogDef | PortEditorConfig | CurveData | string;
   gauge?: SimpleGaugeInfo | null; // For curve tabs with associated gauges
   /** Search term to highlight within the content (e.g., matching field labels in dialogs) */
@@ -610,6 +610,7 @@ function AppContent() {
                "autotune": { title: "AutoTune", icon: "autotune", type: "autotune" },
                "tooth-logger": { title: "Tooth Logger", icon: "scope", type: "tooth-logger" },
                "composite-logger": { title: "Composite Logger", icon: "scope", type: "composite-logger" },
+               "och-status": { title: "Output Channel Status", icon: "dashboard", type: "och-status" },
                "lua-console": { title: "Lua Console", icon: "terminal", type: "lua-console" },
                "settings": { title: "Settings", icon: "settings", type: "settings" },
              };
@@ -1709,6 +1710,30 @@ function AppContent() {
         return;
       }
 
+      if (name === "tooth-logger") {
+        const newTab: Tab = { id: "tooth-logger", title: title || "Tooth Logger", icon: "scope" };
+        setTabs([...tabs, newTab]);
+        setTabContents({ ...tabContents, "tooth-logger": { type: "tooth-logger" } });
+        setActiveTabId("tooth-logger");
+        return;
+      }
+
+      if (name === "composite-logger") {
+        const newTab: Tab = { id: "composite-logger", title: title || "Composite Logger", icon: "scope" };
+        setTabs([...tabs, newTab]);
+        setTabContents({ ...tabContents, "composite-logger": { type: "composite-logger" } });
+        setActiveTabId("composite-logger");
+        return;
+      }
+
+      if (name === "och-status") {
+        const newTab: Tab = { id: "och-status", title: title || "Output Channel Status", icon: "dashboard" };
+        setTabs([...tabs, newTab]);
+        setTabContents({ ...tabContents, "och-status": { type: "och-status" } });
+        setActiveTabId("och-status");
+        return;
+      }
+
       // Try table first
       let tableErr: unknown = null;
       try {
@@ -2218,6 +2243,7 @@ function AppContent() {
     toolItems.push({ id: "autotune", label: "&AutoTune", onClick: () => openTarget("autotune", "AutoTune"), disabled: !currentProject });
     if (caps?.has_datalog_entries || caps?.has_output_channels) {
       toolItems.push({ id: "datalog", label: "&Data Logging", onClick: () => openTarget("datalog", "Data Logging"), disabled: !currentProject });
+      toolItems.push({ id: "och-status", label: "&Output Channel Status", onClick: () => openTarget("och-status", "Output Channel Status"), disabled: !currentProject });
     }
     if (caps?.has_logger_definitions) {
       if (toolItems.length > 0) {
@@ -2602,6 +2628,8 @@ function AppContent() {
         return <ToothLoggerView onClose={() => handleTabClose("tooth-logger")} />;
       case "composite-logger":
         return <CompositeLoggerView onClose={() => handleTabClose("composite-logger")} />;
+      case "och-status":
+        return <OutputChannelStatus />;
       case "console":
         return <EcuConsole ecuType={ecuType} isConnected={status.state === "Connected"} />;
       case "lua-console":

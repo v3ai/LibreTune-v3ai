@@ -1075,7 +1075,7 @@ impl Connection {
     }
 
     /// Decide which runtime fetch command to use (Burst vs OCH)
-    pub(crate) fn choose_runtime_command(&self) -> (RuntimeFetch, String) {
+    pub fn choose_runtime_command(&self) -> (RuntimeFetch, String) {
         // Respect explicit overrides
         let forced = self.config.runtime_packet_mode;
         let burst_cmd = self

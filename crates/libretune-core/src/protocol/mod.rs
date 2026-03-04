@@ -15,7 +15,7 @@ pub mod stream;
 pub use command_builder::CommandBuilder;
 pub use commands::{Command, ConsoleCommand};
 pub use connection::{
-    Connection, ConnectionConfig, ConnectionState, ConnectionType, RuntimePacketMode,
+    Connection, ConnectionConfig, ConnectionState, ConnectionType, RuntimeFetch, RuntimePacketMode,
 };
 pub use error::ProtocolError;
 pub use packet::{Packet, PacketBuilder};

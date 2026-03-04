@@ -198,7 +198,15 @@ async fn start_metrics_task(app: tauri::AppHandle, state: tauri::State<'_, AppSt
                 let tx_pkts_s = if dt > 0.0 { dtxp / dt } else { 0.0 };
                 let rx_pkts_s = if dt > 0.0 { drxp / dt } else { 0.0 };
 
-                let payload = serde_json::json!({
+                // Include stream stats snapshot in metrics payload
+                let stream_snapshot = {
+                    match state.stream_stats.try_lock() {
+                        Ok(s) => Some(s.clone()),
+                        Err(_) => None,
+                    }
+                };
+
+                let mut payload = serde_json::json!({
                     "tx_bps": tx_bps,
                     "rx_bps": rx_bps,
                     "tx_pkts_s": tx_pkts_s,
@@ -207,6 +215,14 @@ async fn start_metrics_task(app: tauri::AppHandle, state: tauri::State<'_, AppSt
                     "rx_total": rx,
                     "timestamp_ms": chrono::Utc::now().timestamp_millis()
                 });
+                if let Some(ss) = stream_snapshot {
+                    if let Ok(ss_val) = serde_json::to_value(&ss) {
+                        payload
+                            .as_object_mut()
+                            .unwrap()
+                            .insert("stream".to_string(), ss_val);
+                    }
+                }
 
                 let _ = app_handle.emit("connection:metrics", payload);
             } else {
@@ -428,6 +444,32 @@ struct AppState {
     rpm_state_tracker: Mutex<RpmStateTracker>,
     // User-Defined Math Channels
     math_channels: Mutex<Vec<UserMathChannel>>,
+    // Stream statistics for Output Channel Status diagnostics
+    stream_stats: Mutex<StreamStats>,
+}
+
+/// Live statistics about the realtime output-channel stream.
+/// Updated by the streaming task on every tick and read by the
+/// `get_output_channel_status` command.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct StreamStats {
+    /// Total ticks since stream started
+    ticks_total: u64,
+    /// Ticks that successfully fetched + emitted data
+    ticks_success: u64,
+    /// Ticks skipped (connection lock busy)
+    ticks_skipped: u64,
+    /// Ticks that resulted in an ECU read error
+    ticks_error: u64,
+    /// Current transfer mode label (e.g. "Burst", "OCH")
+    transfer_mode: String,
+    /// Human-readable reason the mode was chosen
+    transfer_reason: String,
+    /// Stream interval in ms (as configured)
+    interval_ms: u64,
+    /// Epoch-ms when stream started
+    started_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -3598,10 +3640,44 @@ async fn start_realtime_stream(
             cached_def_data.is_some()
         ));
 
+        // Determine transfer mode once and initialize stream stats
+        {
+            let (mode_label, mode_reason) = {
+                let conn_guard = app_state.connection.lock().await;
+                if let Some(conn) = conn_guard.as_ref() {
+                    let (fetch, reason) = conn.choose_runtime_command();
+                    let label = match &fetch {
+                        libretune_core::protocol::RuntimeFetch::Burst(_) => "Burst".to_string(),
+                        libretune_core::protocol::RuntimeFetch::OCH(_) => "OCH".to_string(),
+                    };
+                    (label, reason)
+                } else {
+                    ("Demo".to_string(), "demo mode".to_string())
+                }
+            };
+            let mut stats = app_state.stream_stats.lock().await;
+            *stats = StreamStats {
+                ticks_total: 0,
+                ticks_success: 0,
+                ticks_skipped: 0,
+                ticks_error: 0,
+                transfer_mode: mode_label,
+                transfer_reason: mode_reason,
+                interval_ms: interval,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+            };
+        }
+
         let mut tick_count: u64 = 0;
+        // Local stream stat counters (flushed to shared state periodically)
+        let mut local_ticks_total: u64 = 0;
+        let mut local_ticks_success: u64 = 0;
+        let mut local_ticks_skipped: u64 = 0;
+        let mut local_ticks_error: u64 = 0;
         loop {
             ticker.tick().await;
             tick_count += 1;
+            local_ticks_total += 1;
 
             // Trace: log which phase we're in so we can find deadlocks
             if tick_count <= 25 || tick_count % 20 == 0 {
@@ -3788,6 +3864,8 @@ async fn start_realtime_stream(
 
                     // Feed data to AutoTune if running
                     feed_autotune_data(&app_state, &data, current_time_ms).await;
+
+                    local_ticks_success += 1;
                 }
             } else {
                 // Real ECU mode: read from connection
@@ -3819,6 +3897,16 @@ async fn start_realtime_stream(
                                     "tick #{}: conn_lock busy (held by: {}), skipping",
                                     tick_count, holder
                                 ));
+                            }
+                            local_ticks_skipped += 1;
+                            // Flush stats periodically even on skips
+                            if local_ticks_total % 20 == 0 {
+                                if let Ok(mut stats) = app_state.stream_stats.try_lock() {
+                                    stats.ticks_total = local_ticks_total;
+                                    stats.ticks_success = local_ticks_success;
+                                    stats.ticks_skipped = local_ticks_skipped;
+                                    stats.ticks_error = local_ticks_error;
+                                }
                             }
                             continue;
                         }
@@ -4064,6 +4152,8 @@ async fn start_realtime_stream(
                             stream_log(&format!("tick #{}: T6-autotune", tick_count));
                         }
                         feed_autotune_data(&app_state, &data, current_time_ms).await;
+
+                        local_ticks_success += 1;
                     }
                     (Err(e), _) => {
                         // Log errors to stream log so we can see Phase 1 failures
@@ -4077,8 +4167,19 @@ async fn start_realtime_stream(
                             }
                         }
                         let _ = app_handle.emit("realtime:error", &e);
+                        local_ticks_error += 1;
                     }
                     _ => {}
+                }
+            }
+
+            // Flush local stats to shared state every ~1s (20 ticks at 50ms)
+            if local_ticks_total % 20 == 0 {
+                if let Ok(mut stats) = app_state.stream_stats.try_lock() {
+                    stats.ticks_total = local_ticks_total;
+                    stats.ticks_success = local_ticks_success;
+                    stats.ticks_skipped = local_ticks_skipped;
+                    stats.ticks_error = local_ticks_error;
                 }
             }
         }
@@ -4341,6 +4442,105 @@ async fn get_available_channels(
     // Sort by name for consistent ordering
     channels.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(channels)
+}
+
+/// Full output channel communication status for the diagnostics view.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OutputChannelStatusInfo {
+    /// Total output channels defined in the INI
+    total_channels: usize,
+    /// Channels that read bytes from the OCH block (non-expression, valid offset)
+    channels_consumed: usize,
+    /// Channels that are computed via expressions
+    channels_computed: usize,
+    /// User-defined math channels
+    channels_math: usize,
+    /// ochBlockSize from INI protocol settings (bytes)
+    och_block_size: u32,
+    /// Max unused runtime range from INI (0 = disabled)
+    max_unused_runtime_range: u32,
+    /// Number of OCH blocks needed per read (always 1 for burst, may differ for OCH)
+    och_blocks_needed: u32,
+    /// Current transfer mode (Burst / OCH / Demo)
+    transfer_mode: String,
+    /// Human-readable reason the transfer mode was chosen
+    transfer_reason: String,
+    /// Stream stats
+    stream: StreamStats,
+    /// Estimated records per second (ticks_success / elapsed_seconds)
+    records_per_second: f64,
+}
+
+/// Get comprehensive output channel communication status.
+///
+/// Returns structural data (INI-derived) plus live stream statistics.
+#[tauri::command]
+async fn get_output_channel_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<OutputChannelStatusInfo, String> {
+    let def_guard = state.definition.lock().await;
+    let def = def_guard.as_ref().ok_or("Definition not loaded")?;
+
+    let total_channels = def.output_channels.len();
+    let och_block_size = def.protocol.och_block_size;
+    let max_unused_runtime_range = def.protocol.max_unused_runtime_range;
+
+    // Count channels that consume bytes from the OCH block vs computed channels
+    let mut channels_consumed: usize = 0;
+    let mut channels_computed: usize = 0;
+    for ch in def.output_channels.values() {
+        if ch.is_computed() {
+            channels_computed += 1;
+        } else {
+            // Non-expression channel; check if offset fits within och_block_size
+            let end = ch.offset as u32 + ch.size_bytes() as u32;
+            if och_block_size == 0 || end <= och_block_size {
+                channels_consumed += 1;
+            }
+        }
+    }
+
+    drop(def_guard);
+
+    // Math channel count
+    let math_guard = state.math_channels.lock().await;
+    let channels_math = math_guard.len();
+    drop(math_guard);
+
+    // Stream stats
+    let stats = state.stream_stats.lock().await;
+    let stream = stats.clone();
+    drop(stats);
+
+    // Calculate records/second
+    let records_per_second = if stream.started_at_ms > 0 {
+        let elapsed_ms = chrono::Utc::now().timestamp_millis() - stream.started_at_ms;
+        if elapsed_ms > 0 {
+            (stream.ticks_success as f64) / (elapsed_ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
+    // OCH blocks needed (always 1 for current implementation)
+    let och_blocks_needed = if och_block_size > 0 { 1 } else { 0 };
+
+    Ok(OutputChannelStatusInfo {
+        total_channels,
+        channels_consumed,
+        channels_computed,
+        channels_math,
+        och_block_size,
+        max_unused_runtime_range,
+        och_blocks_needed,
+        transfer_mode: stream.transfer_mode.clone(),
+        transfer_reason: stream.transfer_reason.clone(),
+        stream,
+        records_per_second,
+    })
 }
 
 /// Get suggested status bar channels based on user settings, FrontPage, or common defaults
@@ -13090,6 +13290,7 @@ mod demo_mode_tests {
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         };
 
         let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -13161,6 +13362,7 @@ mod concurrency_tests {
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         });
 
         // Simulate execute_controller_command pattern: lock def -> sleep -> lock conn
@@ -13307,6 +13509,7 @@ signature = "Speeduino 2023-04"
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         };
 
         let matches = find_matching_inis_from_state(&state, "Speeduino 2023-05").await;
@@ -13373,6 +13576,7 @@ signature = "Speeduino 2023-04"
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         };
 
         let matches = find_matching_inis_from_state(&state, "Speeduino 2023-05").await;
@@ -13442,6 +13646,7 @@ signature = "Speeduino 2023-04"
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         };
 
         // Partial match case
@@ -13523,6 +13728,7 @@ signature = "Speeduino 2023-04"
             cached_output_channels: Mutex::new(None),
             connection_factory: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         };
 
         // Install factory returning a partial matching signature
@@ -14027,6 +14233,7 @@ pub fn run() {
             connection_factory: Mutex::new(None),
             cached_output_channels: Mutex::new(None),
             math_channels: Mutex::new(Vec::new()),
+            stream_stats: Mutex::new(StreamStats::default()),
         })
         .invoke_handler(tauri::generate_handler![
             get_serial_ports,
@@ -14055,6 +14262,7 @@ pub fn run() {
             get_gauge_configs,
             get_gauge_config,
             get_available_channels,
+            get_output_channel_status,
             get_status_bar_defaults,
             get_frontpage,
             update_table_data,
