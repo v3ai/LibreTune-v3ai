@@ -1222,7 +1222,7 @@ impl Connection {
                     static OCH_LOG_COUNT: std::sync::atomic::AtomicU64 =
                         std::sync::atomic::AtomicU64::new(0);
                     let n = OCH_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 3 || n % 100 == 0 {
+                    if n < 3 || n.is_multiple_of(100) {
                         eprintln!(
                             "[OCH] tick={} use_modern={} cmd_bytes={:02x?} och_block_size={}",
                             n,

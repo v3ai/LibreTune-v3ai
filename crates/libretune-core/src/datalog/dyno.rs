@@ -153,7 +153,7 @@ impl DynoRun {
             };
 
             // Skip unreasonable RPM values
-            if rpm < 100.0 || rpm > 20000.0 {
+            if !(100.0..=20000.0).contains(&rpm) {
                 continue;
             }
 
@@ -230,7 +230,7 @@ impl DynoRun {
             }
 
             let rpm: f64 = match fields[col_map.rpm_col].trim().parse() {
-                Ok(v) if v >= 100.0 && v <= 20000.0 => v,
+                Ok(v) if (100.0..=20000.0).contains(&v) => v,
                 _ => continue,
             };
 

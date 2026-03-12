@@ -66,6 +66,9 @@ pub enum RegionType {
     Transition,
 }
 
+/// A region definition: (name, type, row_range, col_range)
+type RegionDef = (String, RegionType, (usize, usize), (usize, usize));
+
 /// Configuration for the health scorer
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthConfig {
@@ -231,7 +234,7 @@ impl HealthScorer {
         y_bins: &[f64],
         rows: usize,
         cols: usize,
-    ) -> Vec<(String, RegionType, (usize, usize), (usize, usize))> {
+    ) -> Vec<RegionDef> {
         let mut regions = Vec::new();
 
         // Find RPM boundary indices
@@ -394,7 +397,7 @@ impl HealthScorer {
                     .unwrap_or(0.0);
 
                 // Horizontal gradient
-                if c + 1 <= col_range.1 {
+                if c < col_range.1 {
                     let next = table_values
                         .get(r)
                         .and_then(|row| row.get(c + 1))
@@ -403,7 +406,7 @@ impl HealthScorer {
                     gradients.push((next - val).abs());
                 }
                 // Vertical gradient
-                if r + 1 <= row_range.1 {
+                if r < row_range.1 {
                     let next = table_values
                         .get(r + 1)
                         .and_then(|row| row.get(c))

@@ -50,35 +50,28 @@ impl Write for SerialChannel {
 
 impl CommunicationChannel for SerialChannel {
     fn set_timeout(&mut self, timeout: Duration) -> io::Result<()> {
-        self.port
-            .set_timeout(timeout)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.port.set_timeout(timeout).map_err(io::Error::other)
     }
 
     fn clear_input_buffer(&mut self) -> io::Result<()> {
         self.port
             .clear(serialport::ClearBuffer::Input)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 
     fn clear_output_buffer(&mut self) -> io::Result<()> {
         self.port
             .clear(serialport::ClearBuffer::Output)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+            .map_err(io::Error::other)
     }
 
     fn try_clone(&self) -> io::Result<Box<dyn CommunicationChannel>> {
-        let port_clone = self
-            .port
-            .try_clone()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let port_clone = self.port.try_clone().map_err(io::Error::other)?;
         Ok(Box::new(SerialChannel::new(port_clone)))
     }
 
     fn bytes_to_read(&mut self) -> io::Result<u32> {
-        self.port
-            .bytes_to_read()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        self.port.bytes_to_read().map_err(io::Error::other)
     }
 }
 

@@ -98,6 +98,7 @@ impl VePredictor {
 
         // Build known cells map: (row, col) -> (value, hit_count)
         let mut known: HashMap<(usize, usize), (f64, u32)> = HashMap::new();
+        #[allow(clippy::needless_range_loop)]
         for r in 0..rows {
             for c in 0..cols {
                 let hits = hit_counts
@@ -176,6 +177,7 @@ impl VePredictor {
     }
 
     /// Try bilinear interpolation from 4 surrounding known cells
+    #[allow(clippy::too_many_arguments)]
     fn try_bilinear(
         &self,
         row: usize,
@@ -242,6 +244,7 @@ impl VePredictor {
     }
 
     /// Find nearest known cell in a given direction
+    #[allow(clippy::too_many_arguments)]
     fn find_nearest_known(
         &self,
         row: usize,

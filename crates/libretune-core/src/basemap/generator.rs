@@ -263,7 +263,7 @@ pub fn generate_ignition_table(
 
             // Idle timing: fixed ~15° for stability
             if rpm < idle * 1.2 && load < 50.0 {
-                advance = advance.max(12.0).min(18.0);
+                advance = advance.clamp(12.0, 18.0);
             }
 
             table[r][c] = advance.clamp(0.0, 45.0).round();

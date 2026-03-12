@@ -203,14 +203,14 @@ impl IniRepository {
 
             // Look for signature in [MegaTune] section
             if line.to_lowercase().starts_with("signature") {
-                if let Some(val) = line.splitn(2, '=').nth(1) {
+                if let Some((_, val)) = line.split_once('=') {
                     signature = Self::extract_quoted_value(val);
                 }
             }
 
             // Look for nEmu in [MegaTune] section for display name
             if line.to_lowercase().starts_with("nemu") {
-                if let Some(val) = line.splitn(2, '=').nth(1) {
+                if let Some((_, val)) = line.split_once('=') {
                     name = Self::extract_quoted_value(val);
                 }
             }

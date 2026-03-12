@@ -22,8 +22,8 @@ use libretune_core::plugin_system::{
 };
 use libretune_core::project::{
     format_commit_message, load_math_channels, save_math_channels, BranchInfo, CommitDiff,
-    CommitInfo, ConnectionSettings, IniRepository, IniSource, OnlineIniEntry, OnlineIniRepository,
-    Project, ProjectConfig, ProjectSettings, UserMathChannel, VersionControl,
+    CommitInfo, IniRepository, IniSource, OnlineIniEntry, OnlineIniRepository, Project,
+    UserMathChannel, VersionControl,
 };
 use libretune_core::protocol::serial::list_ports;
 use libretune_core::protocol::{Connection, ConnectionConfig, ConnectionState};
@@ -969,8 +969,8 @@ fn compare_signatures(ecu_sig: &str, ini_sig: &str) -> SignatureMatchType {
     // RusEFI signatures often end with a hash or unique ID (e.g. "rusEFI master 2024.02.24.simulator.12345678")
     // If both end with the same alphanumeric string > 6 chars, treat as Exact.
     if let (Some(ecu_suffix), Some(ini_suffix)) = (
-        ecu_normalized.split('.').last(),
-        ini_normalized.split('.').last(),
+        ecu_normalized.split('.').next_back(),
+        ini_normalized.split('.').next_back(),
     ) {
         if ecu_suffix.len() > 6
             && ecu_suffix.chars().all(|c| c.is_alphanumeric())
@@ -1547,6 +1547,7 @@ async fn load_ini(
 ///
 /// Returns: ConnectResult with ECU signature and optional mismatch info
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn connect_to_ecu(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
@@ -3289,7 +3290,7 @@ async fn get_realtime_data(
         let cached: Option<Arc<HashMap<String, libretune_core::ini::OutputChannel>>>;
         {
             let channels_cache_guard = state.cached_output_channels.lock().await;
-            cached = channels_cache_guard.as_ref().map(|c| Arc::clone(c));
+            cached = channels_cache_guard.as_ref().map(Arc::clone);
         } // cached_output_channels lock released
 
         let def_guard = state.definition.lock().await;
@@ -3617,7 +3618,7 @@ async fn start_realtime_stream(
             let cached_ch: Option<Arc<HashMap<String, libretune_core::ini::OutputChannel>>>;
             {
                 let channels_cache = app_state.cached_output_channels.lock().await;
-                cached_ch = channels_cache.as_ref().map(|c| Arc::clone(c));
+                cached_ch = channels_cache.as_ref().map(Arc::clone);
             } // lock released
 
             // Step B: get endianness from definition (separate lock)
@@ -3680,7 +3681,7 @@ async fn start_realtime_stream(
             local_ticks_total += 1;
 
             // Trace: log which phase we're in so we can find deadlocks
-            if tick_count <= 25 || tick_count % 20 == 0 {
+            if tick_count <= 25 || tick_count.is_multiple_of(20) {
                 stream_log(&format!("tick #{}: T1-demo_mode", tick_count));
             }
             let is_demo = match app_state.demo_mode.try_lock() {
@@ -3874,7 +3875,7 @@ async fn start_realtime_stream(
                 // Phase 1: Get raw data from ECU (hold connection lock only during I/O)
                 // Use try_lock() to avoid blocking forever if another command
                 // (e.g. get_all_constant_values) is holding the connection lock.
-                if tick_count <= 25 || tick_count % 20 == 0 {
+                if tick_count <= 25 || tick_count.is_multiple_of(20) {
                     stream_log(&format!("tick #{}: T2-conn_lock", tick_count));
                 }
                 let raw_result: Result<Vec<u8>, String>;
@@ -3891,7 +3892,7 @@ async fn start_realtime_stream(
                         }
                         Err(_) => {
                             // Connection lock is busy (another command is using it) — skip this tick
-                            if tick_count <= 25 || tick_count % 20 == 0 {
+                            if tick_count <= 25 || tick_count.is_multiple_of(20) {
                                 let holder = get_conn_lock_holder();
                                 stream_log(&format!(
                                     "tick #{}: conn_lock busy (held by: {}), skipping",
@@ -3900,7 +3901,7 @@ async fn start_realtime_stream(
                             }
                             local_ticks_skipped += 1;
                             // Flush stats periodically even on skips
-                            if local_ticks_total % 20 == 0 {
+                            if local_ticks_total.is_multiple_of(20) {
                                 if let Ok(mut stats) = app_state.stream_stats.try_lock() {
                                     stats.ticks_total = local_ticks_total;
                                     stats.ticks_success = local_ticks_success;
@@ -3920,7 +3921,7 @@ async fn start_realtime_stream(
                             std::sync::atomic::AtomicU64::new(0);
                         let count =
                             STREAM_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if count < 5 || count % 100 == 0 {
+                        if count < 5 || count.is_multiple_of(100) {
                             eprintln!(
                                 "[DEBUG] stream tick #{}: got {} raw bytes",
                                 count,
@@ -3933,7 +3934,7 @@ async fn start_realtime_stream(
                             std::sync::atomic::AtomicU64::new(0);
                         let count =
                             ERR_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if count < 10 || count % 50 == 0 {
+                        if count < 10 || count.is_multiple_of(50) {
                             eprintln!(
                                 "[ERROR] stream tick #{}: get_realtime_data failed: {}",
                                 count, e
@@ -3943,7 +3944,7 @@ async fn start_realtime_stream(
                 }
 
                 // Phase 2: Use pre-cached output channels and endianness (no locks needed)
-                if tick_count <= 25 || tick_count % 20 == 0 {
+                if tick_count <= 25 || tick_count.is_multiple_of(20) {
                     stream_log(&format!("tick #{}: T3-phase2(cached)", tick_count));
                 }
                 let def_data = &cached_def_data;
@@ -3959,21 +3960,20 @@ async fn start_realtime_stream(
                         for (name, channel) in output_channels.iter() {
                             if channel.is_computed() {
                                 computed_channels.push((name.clone(), channel.clone()));
-                            } else if let Some(val) = channel.parse(&raw, *endianness) {
+                            } else if let Some(val) = channel.parse(raw, *endianness) {
                                 data.insert(name.clone(), val);
                             }
                         }
 
                         // Pass 2: Evaluate computed channels using parsed values as context
                         for (name, channel) in computed_channels {
-                            if let Some(val) = channel.parse_with_context(&raw, *endianness, &data)
-                            {
+                            if let Some(val) = channel.parse_with_context(raw, *endianness, &data) {
                                 data.insert(name, val);
                             }
                         }
 
                         // Pass 3: User Math Channels Evaluation
-                        if tick_count <= 25 || tick_count % 20 == 0 {
+                        if tick_count <= 25 || tick_count.is_multiple_of(20) {
                             stream_log(&format!("tick #{}: T4-math_ch", tick_count));
                         }
                         if let Ok(mut channels_guard) = app_state.math_channels.try_lock() {
@@ -4104,7 +4104,7 @@ async fn start_realtime_stream(
                                 std::sync::atomic::AtomicU64::new(0);
                             let count =
                                 EMIT_LOG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if count < 30 || count % 20 == 0 {
+                            if count < 30 || count.is_multiple_of(20) {
                                 let rpm = data
                                     .get("rpm")
                                     .or_else(|| data.get("RPM"))
@@ -4120,7 +4120,7 @@ async fn start_realtime_stream(
                         }
 
                         // Check for RPM state transitions (key-on/off detection)
-                        if tick_count <= 25 || tick_count % 20 == 0 {
+                        if tick_count <= 25 || tick_count.is_multiple_of(20) {
                             stream_log(&format!("tick #{}: T5-rpm_state", tick_count));
                         }
                         {
@@ -4148,7 +4148,7 @@ async fn start_realtime_stream(
                         }
 
                         // Feed data to AutoTune if running
-                        if tick_count <= 25 || tick_count % 20 == 0 {
+                        if tick_count <= 25 || tick_count.is_multiple_of(20) {
                             stream_log(&format!("tick #{}: T6-autotune", tick_count));
                         }
                         feed_autotune_data(&app_state, &data, current_time_ms).await;
@@ -4162,7 +4162,7 @@ async fn start_realtime_stream(
                                 std::sync::atomic::AtomicU64::new(0);
                             let n =
                                 ERR_STREAM_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if n < 10 || n % 50 == 0 {
+                            if n < 10 || n.is_multiple_of(50) {
                                 stream_log(&format!("stream error #{}: {}", n, e));
                             }
                         }
@@ -4174,7 +4174,7 @@ async fn start_realtime_stream(
             }
 
             // Flush local stats to shared state every ~1s (20 ticks at 50ms)
-            if local_ticks_total % 20 == 0 {
+            if local_ticks_total.is_multiple_of(20) {
                 if let Ok(mut stats) = app_state.stream_stats.try_lock() {
                     stats.ticks_total = local_ticks_total;
                     stats.ticks_success = local_ticks_success;
@@ -6629,8 +6629,7 @@ async fn merge_from_tune(
                     if let Some(constant) = def.constants.get(name) {
                         // Update raw page data in cache via write_bytes
                         if let libretune_core::tune::TuneValue::Scalar(v) = value {
-                            let raw_val =
-                                ((*v - constant.translate as f64) / constant.scale as f64) as i64;
+                            let raw_val = ((*v - constant.translate) / constant.scale) as i64;
                             let page = constant.page;
                             let offset = constant.offset;
                             cache.write_bytes(page, offset, &[(raw_val & 0xFF) as u8]);
@@ -12278,6 +12277,7 @@ async fn validate_math_expression(expr: String) -> Result<String, String> {
 
 /// Generate a base map from engine specifications
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn generate_base_map(
     cylinder_count: u8,
     displacement_cc: f64,

@@ -185,6 +185,7 @@ impl AnomalyDetector {
         }
 
         // Check column-wise (increasing load/MAP should generally increase VE)
+        #[allow(clippy::needless_range_loop)]
         for c in 0..cols {
             for r in 1..rows {
                 let prev = table[r - 1][c];
@@ -309,6 +310,7 @@ impl AnomalyDetector {
         cols: usize,
         anomalies: &mut Vec<TuneAnomaly>,
     ) {
+        #[allow(clippy::needless_range_loop)]
         for r in 0..rows {
             for c in 0..cols {
                 let val = table[r][c];
@@ -426,6 +428,7 @@ impl AnomalyDetector {
         let c_start = col.saturating_sub(1);
         let c_end = (col + 2).min(cols);
 
+        #[allow(clippy::needless_range_loop)]
         for r in r_start..r_end {
             for c in c_start..c_end {
                 if r == row && c == col {
