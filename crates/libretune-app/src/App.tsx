@@ -307,10 +307,7 @@ function AppContent() {
   // Tune mismatch dialog state
   const [tuneMismatchOpen, setTuneMismatchOpen] = useState(false);
   const [tuneMismatchInfo, setTuneMismatchInfo] = useState<TuneMismatchInfo | null>(null);
-  
-  // Tune comparison dialog state
-  const [tuneComparisonOpen, setTuneComparisonOpen] = useState(false);
-  
+
   // Table comparison dialog state
   const [tableComparisonOpen, setTableComparisonOpen] = useState(false);
   
@@ -932,19 +929,6 @@ function AppContent() {
         result.errors.forEach(err => console.warn("Sync error:", err));
       }
       
-      // Compare tunes after successful sync
-      // if (result.pages_synced > 0) {
-      //   try {
-      //     const differs = await invoke<boolean>("compare_project_and_ecu_tunes");
-      //     if (differs) {
-      //       setTuneComparisonOpen(true);
-      //     }
-      //   } catch (e) {
-      //     console.error("Failed to compare tunes:", e);
-      //     // Don't block on comparison failure
-      //   }
-      // }
-      
       return result;
     } catch (e) {
       console.error("Sync failed completely:", e);
@@ -1303,7 +1287,8 @@ function AppContent() {
       await invoke("load_tune", { path: tunePath });
       // Refresh constants so the UI reflects the loaded tune
       // (open views refresh via the backend's tune:loaded event)
-      await fetchConstants();
+      const values = await fetchConstants();
+      await fetchMenuTree(values);
       showToast("Tune file loaded successfully", "success");
     } catch (e) {
       showToast("Failed to load tune: " + e, "error");
@@ -1882,9 +1867,6 @@ function AppContent() {
         setAfrCalibrationOpen={setAfrCalibrationOpen}
         tempCalibrationOpen={tempCalibrationOpen}
         setTempCalibrationOpen={setTempCalibrationOpen}
-        tuneComparisonOpen={tuneComparisonOpen}
-        setTuneComparisonOpen={setTuneComparisonOpen}
-        checkStatus={checkStatus}
         tableComparisonOpen={tableComparisonOpen}
         setTableComparisonOpen={setTableComparisonOpen}
         tuneFileDiffOpen={tuneFileDiffOpen}
