@@ -42,11 +42,12 @@ impl EcuType {
             return EcuType::FOME;
         }
 
-        // Check for epicEFI (contains "epicECU" or filename suggests it)
-        if sig_lower.contains("epicECU")
+        // Check for epicEFI (signature is "epicEFI …"; board names use epicECU)
+        if sig_lower.contains("epicefi")
+            || sig_lower.contains("epicecu")
             || filename_lower
                 .as_ref()
-                .is_some_and(|f| f.contains("epicECU"))
+                .is_some_and(|f| f.contains("epicefi") || f.contains("epicecu"))
         {
             return EcuType::EpicEFI;
         }
@@ -427,8 +428,16 @@ pub fn parse_shape_field(s: &str) -> ParsedShape {
             if let (Some(cols), Some(rows)) = (parse_brace_name(a), parse_brace_name(b)) {
                 return ParsedShape::Dynamic2D { cols, rows };
             }
-            if let (Ok(rows), Ok(cols)) = (a.parse(), b.parse()) {
-                // Fixed form: Speeduino / LibreTune `[rows x cols]`.
+            if let (Ok(cols), Ok(rows)) = (a.parse(), b.parse()) {
+                // Same TunerStudio column-first order as the braced form above.
+                //
+                // This arm used to read `[AxB]` as `[rows x cols]` while the
+                // braced arm read the identical syntax as `[cols x rows]`.
+                // Every checked-in fixture array is square, which is why the
+                // disagreement went unnoticed. rusEFI's `demo.ini` settles it:
+                // `torqueReductionIgnitionCutTable = array, S08, 21933, [6x2]`
+                // is driven by a six-entry `xBins` and a two-entry `yBins`, so
+                // the first token is the column count.
                 return ParsedShape::Fixed(Shape::Array2D { rows, cols });
             }
         }
@@ -975,6 +984,16 @@ pub struct ProtocolSettings {
     /// Page identifiers for multi-page ECUs (raw byte sequences)
     pub page_identifiers: Vec<Vec<u8>>,
 
+    /// The `pageIdentifier` entries exactly as the INI wrote them, before
+    /// `$varName` substitution and escape decoding.
+    ///
+    /// `[Constants]` precedes `[PcVariables]` in every real INI, so the first
+    /// substitution pass runs before `$tsCanId` has a value. Keeping the source
+    /// text lets the post-parse pass redo it once the variable is known -
+    /// `page_identifiers` is `Vec<Vec<u8>>` and cannot be re-substituted.
+    #[serde(default)]
+    pub page_identifiers_raw: Vec<String>,
+
     /// Page sizes in bytes for each page
     pub page_sizes: Vec<u32>,
 
@@ -1082,6 +1101,7 @@ impl Default for ProtocolSettings {
             query_command: "Q".to_string(),
             delay_after_port_open: 0,
             page_identifiers: Vec::new(),
+            page_identifiers_raw: Vec::new(),
             page_sizes: Vec::new(),
             page_read_commands: Vec::new(),
             page_chunk_write_commands: Vec::new(),
@@ -1143,6 +1163,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detect_epicefi_from_lowercased_signature() {
+        assert_eq!(
+            EcuType::detect("epicEFI dev.2026.09.12.alphax-8chan_f7.134812558", None),
+            EcuType::EpicEFI
+        );
+        assert_eq!(
+            EcuType::detect("epicECU test", Some("rusEFI2025.epicECU.ini")),
+            EcuType::EpicEFI
+        );
+        assert!(EcuType::EpicEFI.supports_console());
+    }
+
+    #[test]
     fn test_data_type_parsing() {
         assert_eq!(DataType::from_ini_str("U08"), Some(DataType::U08));
         assert_eq!(DataType::from_ini_str("uint16"), Some(DataType::U16));
@@ -1160,8 +1193,38 @@ mod tests {
         );
         assert_eq!(
             Shape::from_ini_str("[8X12]"),
-            Shape::Array2D { rows: 8, cols: 12 }
+            Shape::Array2D { rows: 12, cols: 8 }
         );
+    }
+
+    /// `[AxB]` is column-first in both its literal and its `{brace}` form.
+    ///
+    /// The two arms used to disagree: `[{cols}x{rows}]` mapped the first token
+    /// to columns while `[8x12]` mapped it to rows. Every checked-in fixture
+    /// array is square, which is why nothing caught it. rusEFI's `demo.ini`
+    /// settles the order - `torqueReductionIgnitionCutTable = array, S08,
+    /// 21933, [6x2]` is driven by a six-entry `xBins` and a two-entry `yBins`,
+    /// so the first token is the column count.
+    #[test]
+    fn non_square_shapes_are_column_first_in_both_forms() {
+        assert_eq!(
+            parse_shape_field("[6x2]"),
+            ParsedShape::Fixed(Shape::Array2D { rows: 2, cols: 6 }),
+            "literal [AxB] must read as [cols x rows]"
+        );
+        assert_eq!(
+            parse_shape_field("[{a}x{b}]"),
+            ParsedShape::Dynamic2D {
+                cols: "a".into(),
+                rows: "b".into(),
+            },
+            "braced [AxB] must read as [cols x rows]"
+        );
+
+        let fixed = Shape::from_ini_str("[6x2]");
+        assert_eq!(fixed.x_size(), 6);
+        assert_eq!(fixed.y_size(), 2);
+        assert_eq!(fixed.element_count(), 12);
     }
 
     #[test]

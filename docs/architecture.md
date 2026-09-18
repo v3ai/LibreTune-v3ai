@@ -57,8 +57,6 @@ Public modules (post-Phase 7):
 - `plugin_api`, `plugin_system` — WASM plugin host + plugin-facing API.
   (The legacy Java plugin host has been removed; see Phase 3 in the
   changelog.)
-- `port_editor` — Port/pin assignment model behind the hardware
-  configuration UI.
 - `project` — Project model, repository, online-INI repository.
 - `protocol` — `Connection`, `ConnectionState`, transport abstractions
   (Serial, TCP, in-process simulator).
@@ -217,8 +215,8 @@ cd crates/libretune-app
 npm install
 npm run dev          # Vite only
 ./scripts/tauri-dev.sh  # Full Tauri dev (preferred)
-npx tsc --noEmit     # Typecheck
-npm test -- --run    # Vitest
+npm run typecheck    # Typecheck
+npm run test:run     # Vitest
 npm run build        # Production bundle
 ```
 

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { emit } from '@tauri-apps/api/event';
-import { ArrowLeft, Save, Zap, ExternalLink, AlertTriangle, Palette, MapPin, Crosshair, Box, Scaling } from 'lucide-react';
+import { ArrowLeft, Save, Zap, ExternalLink, AlertTriangle, Palette, MapPin, Crosshair, Box, Scaling, ArrowUpDown } from 'lucide-react';
 import TableToolbar from './TableToolbar';
 import TableGrid, { SelectionRange } from './TableGrid';
 import TableEditor3D from './TableEditor3D';
@@ -11,12 +11,18 @@ import RebinDialog from '../dialogs/RebinDialog';
 import SetTableSizeDialog from '../dialogs/SetTableSizeDialog';
 import CellEditDialog from '../dialogs/CellEditDialog';
 import GenerateTableDialog from '../dialogs/GenerateTableDialog';
+import TableAdjustDialog from './TableAdjustDialog';
 import { classifyGeneratableTable, generatableTableLabel } from '../../utils/tableGenerator';
-import { Dialog, Button, FormField } from '../common';
+import {
+  parseTableAdjustInput,
+  tableAdjustResultError,
+  tableAdjustTransform,
+  type TableAdjustKind,
+} from '../../utils/tableAdjustInput';
 import type { BackendTableData, TableSizeInfo } from '../../types/app';
 import LambdaPreviewTable from './LambdaPreviewTable';
 import { useHeatmapSettings } from '../../utils/useHeatmapSettings';
-import { useTableYAxisBottom, useTrailFadeSec } from '../../utils/useTableOrientation';
+import { useTableYAxisBottom, setTableYAxisBottom, useTrailFadeSec } from '../../utils/useTableOrientation';
 import { useChannels } from '../../stores/realtimeStore';
 import { useToast } from '../../contexts/ToastContext';
 import { getHotkeyManager } from '../../services/hotkeyService';
@@ -24,6 +30,7 @@ import './TableComponents.css';
 import './TableEditor2D.css';
 import TableLiveReadout from './TableLiveReadout';
 import { hasEmbeddedTableLiveReadout, resolveEmbeddedTableOutputChannel } from './tableLiveChannels';
+import { useDialogValueSource } from '../dialogs/DialogValueSource';
 
 type TableOperationResult = {
   table_name: string;
@@ -31,6 +38,10 @@ type TableOperationResult = {
   y_bins: number[];
   z_values: number[][];
 };
+
+/** Stable empty-array reference so TableGrid's memo doesn't see a "new" prop
+ * every render just because the trail is hidden. */
+const EMPTY_HISTORY_TRAIL: [number, number][] = [];
 
 /**
  * Props for the TableEditor2D component.
@@ -127,6 +138,7 @@ export default function TableEditor2D({
   onOpenInTab,
   onValuesChange,
 }: TableEditor2DProps) {
+  const readOnly = !!useDialogValueSource()?.readOnly;
   // Determine if data is valid - used for conditional rendering after hooks
   const hasValidData = 
     z_values && Array.isArray(z_values) && z_values.length > 0 &&
@@ -157,14 +169,37 @@ export default function TableEditor2D({
   const [localZValues, setLocalZValuesState] = useState<number[][]>([...safeZValues]);
   const [localXBins, setLocalXBins] = useState<number[]>([...safeXBins]);
   const [localYBins, setLocalYBins] = useState<number[]>([...safeYBins]);
-  
+
+  // Resync local edit state when the underlying table data changes out from
+  // under us — e.g. a tune:loaded refresh (useTableCurveRefresh) or this same
+  // mounted instance being reused for a different table/tune. Mirrors
+  // CurveEditor.tsx's equivalent effect. Without this, this component had no
+  // way to pick up new props once mounted (unless the caller happened to
+  // remount it via a changing `key`).
+  useEffect(() => {
+    if (hasValidData) {
+      setLocalZValuesState(z_values.map(row => [...row]));
+      setLocalXBins([...x_bins]);
+      setLocalYBins([...y_bins]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasValidData, z_values, x_bins, y_bins]);
+
   const [selectionRange, setSelectionRange] = useState<SelectionRange | null>(null);
   const [lockedCells, setLockedCells] = useState<Set<string>>(new Set());
   const [historyTrail, setHistoryTrail] = useState<[number, number, number][]>([]);
   const [showColorShade, setShowColorShade] = useState(true);
   const [showHistoryTrail, setShowHistoryTrail] = useState(true);
   const [show3D, setShow3D] = useState(false);
-  
+
+  // Memoized so TableGrid (React.memo'd) doesn't see a new array reference —
+  // and re-render every cell — on renders where the trail itself hasn't
+  // changed (e.g. an unrelated realtime tick).
+  const visibleHistoryTrail = useMemo<[number, number][]>(
+    () => (showHistoryTrail ? historyTrail.map(([x, y]) => [x, y] as [number, number]) : EMPTY_HISTORY_TRAIL),
+    [showHistoryTrail, historyTrail]
+  );
+
   // History Stack
   type HistorySnapshot = {
     z: number[][];
@@ -204,10 +239,12 @@ export default function TableEditor2D({
     value: 0,
   });
 
-  const [scaleDialog, setScaleDialog] = useState<{ show: boolean; factor: string }>({
-    show: false,
-    factor: '1.05',
-  });
+  const [adjustDialog, setAdjustDialog] = useState<{
+    show: boolean;
+    kind: TableAdjustKind;
+    raw: string;
+    error: string | null;
+  }>({ show: false, kind: 'mul', raw: '0.9', error: null });
 
   const [followMode, setFollowMode] = useState(true);
   const [activeCell, setActiveCell] = useState<[number, number] | null>(null);
@@ -215,6 +252,10 @@ export default function TableEditor2D({
   const { showToast } = useToast();
 
   useEffect(() => {
+    if (readOnly) {
+      setSizeInfo(null);
+      return;
+    }
     let cancelled = false;
     invoke<BackendTableData>('get_table_data', { tableName: table_name })
       .then((data) => {
@@ -226,7 +267,7 @@ export default function TableEditor2D({
     return () => {
       cancelled = true;
     };
-  }, [table_name]);
+  }, [table_name, readOnly]);
 
   const [alertLargeChangeEnabled, setAlertLargeChangeEnabled] = useState(true);
   const [alertLargeChangeAbs, setAlertLargeChangeAbs] = useState(5);
@@ -303,12 +344,13 @@ export default function TableEditor2D({
   const setLocalZValues = useCallback(
     (values: number[][]) => {
       setLocalZValuesState(values);
+      if (readOnly) return;
       invoke('update_table_data', { tableName: table_name, zValues: values })
         // Loudly. The previous `.then(() => {})` had no catch at all, so a
         // rejected write left the grid showing values the ECU never received.
         .catch((err) => handleOperationError('Saving table', err));
     },
-    [table_name, handleOperationError]
+    [table_name, handleOperationError, readOnly]
   );
 
   useEffect(() => {
@@ -475,6 +517,7 @@ export default function TableEditor2D({
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
         return;
       }
+      if (adjustDialog.show) return;
 
       const isCtrl = e.ctrlKey || e.metaKey;
       const isShift = e.shiftKey;
@@ -577,7 +620,7 @@ export default function TableEditor2D({
       }
       if (matchesAction('table.scale') || e.key === '*') {
         e.preventDefault();
-        openScaleDialog();
+        openAdjust('mul');
         return;
       }
       if (matchesAction('table.interpolate') || e.key === '/') {
@@ -654,7 +697,7 @@ export default function TableEditor2D({
 
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [selectionRange, followMode, activeCell, localZValues]);
+  }, [selectionRange, followMode, activeCell, localZValues, yAxisBottom, adjustDialog.show]);
 
   // Arrow key navigation helper
   const handleArrowNavigation = (key: string, extendSelection: boolean) => {
@@ -698,7 +741,10 @@ export default function TableEditor2D({
     setActiveCell([newX, newY]);
   };
 
-  const handleCellChange = (
+  // Memoized (React.memo'd TableGrid relies on these staying referentially
+  // stable across renders that don't actually change table state — e.g. a
+  // realtime tick unrelated to this table — otherwise memo does nothing).
+  const handleCellChange = useCallback((
     x: number,
     y: number,
     value: number,
@@ -707,7 +753,7 @@ export default function TableEditor2D({
     const prevValue = localZValues[y][x];
     const newValues = localZValues.map(row => [...row]);
     newValues[y][x] = value;
-    
+
     setLocalZValues(newValues);
     setSelectionRange({ start: [x,y], end: [x,y] });
     pushHistory(newValues, localXBins, localYBins);
@@ -716,9 +762,9 @@ export default function TableEditor2D({
     if (!options?.suppressAlert) {
       warnIfLargeChange(prevValue, value, options?.operation ?? 'Cell edit');
     }
-  };
+  }, [localZValues, localXBins, localYBins, setLocalZValues, pushHistory, onValuesChange, warnIfLargeChange]);
 
-  const handleAxisChange = (axis: 'x' | 'y', index: number, value: number) => {
+  const handleAxisChange = useCallback((axis: 'x' | 'y', index: number, value: number) => {
     if (axis === 'x') {
       const newBins = [...localXBins];
       newBins[index] = value;
@@ -732,7 +778,7 @@ export default function TableEditor2D({
       setRebinDialog(prev => ({ ...prev, newYBins: newBins }));
       pushHistory(localZValues, localXBins, newBins);
     }
-  };
+  }, [localXBins, localYBins, localZValues, pushHistory]);
 
   // TunerStudio-compatible .table file import/export for this one table.
   // import_table_from_file already writes the result to the tune/ECU cache
@@ -830,10 +876,6 @@ export default function TableEditor2D({
     handleSetEqual();
   };
 
-  const handleScaleWrapper = () => {
-    openScaleDialog();
-  };
-
   const handleContextMenuSetEqual = (_value: number) => {
     setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
     handleSetEqual();
@@ -885,17 +927,33 @@ export default function TableEditor2D({
     }
   };
 
-  const openScaleDialog = () => {
+  const openAdjust = (kind: TableAdjustKind) => {
     if (selectedCellsCoords.length === 0) return;
     setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
-    setScaleDialog(prev => ({ ...prev, show: true }));
+    setAdjustDialog({
+      show: true,
+      kind,
+      raw: kind === 'mul' ? '0.9' : '10',
+      error: null,
+    });
   };
 
-  const handleScaleDialogApply = () => {
-    const factor = parseFloat(scaleDialog.factor);
-    if (!Number.isFinite(factor)) return;
-    setScaleDialog(prev => ({ ...prev, show: false }));
-    handleScale(factor);
+  const applyAdjust = () => {
+    const parsed = parseTableAdjustInput(adjustDialog.raw, adjustDialog.kind);
+    if (!parsed.ok) {
+      setAdjustDialog((d) => ({ ...d, error: parsed.error }));
+      return;
+    }
+    const values = selectedCellsCoords.map(([x, y]) => localZValues[y][x]);
+    const next = tableAdjustTransform(adjustDialog.kind, parsed.value);
+    const resultError = tableAdjustResultError(values, next, { tableKind: generatableKind });
+    if (resultError) {
+      setAdjustDialog((d) => ({ ...d, error: resultError }));
+      return;
+    }
+    if (adjustDialog.kind === 'mul') handleScale(parsed.value);
+    else handleAddOffset(adjustDialog.kind === 'add' ? parsed.value : -parsed.value);
+    setAdjustDialog((d) => ({ ...d, show: false, error: null }));
   };
 
   const handleSmooth = async () => {
@@ -1065,14 +1123,14 @@ export default function TableEditor2D({
     handleCellChange(cellEditDialog.col, cellEditDialog.row, value, { operation: 'Cell edit' });
   };
 
-  const handleCellDoubleClick = (x: number, y: number) => {
+  const handleCellDoubleClick = useCallback((x: number, y: number) => {
     setCellEditDialog({
       show: true,
       row: y,
       col: x,
       value: localZValues[y][x],
     });
-  };
+  }, [localZValues]);
 
   const handleCopy = async () => {
     if (!selectionRange) return;
@@ -1207,7 +1265,7 @@ export default function TableEditor2D({
     }
   };
 
-  const handleCellLock = (x: number, y: number, locked: boolean) => {
+  const handleCellLock = useCallback((x: number, y: number, locked: boolean) => {
     const key = `${x},${y}`;
     const newLocked = new Set(lockedCells);
     if (locked) {
@@ -1216,15 +1274,15 @@ export default function TableEditor2D({
       newLocked.delete(key);
     }
     setLockedCells(newLocked);
-  };
+  }, [lockedCells]);
 
-  const handleSelectionChange = (range: SelectionRange | null) => {
+  const handleSelectionChange = useCallback((range: SelectionRange | null) => {
     setSelectionRange(range);
     if (range) {
       setActiveCell(range.end);
       setContextMenu({ visible: false, x: 0, y: 0, value: 0 });
     }
-  };
+  }, []);
 
   /**
    * Explicit re-send. Edits already persist as they are made, so this is now a
@@ -1292,12 +1350,40 @@ export default function TableEditor2D({
 
   return (
     <div
-      className={`table-editor-2d ${embedded ? 'embedded' : 'standalone'}${fitVeViewport ? ' table-editor-2d--ve-fit' : ''}`}
+      className={`table-editor-2d ${embedded ? 'embedded' : 'standalone'}${fitVeViewport ? ' table-editor-2d--ve-fit' : ''}${readOnly ? ' is-readonly' : ''}`}
     >
       {/* Embedded mode: compact title bar with pop-out button */}
       {embedded && (
         <div className="embedded-header">
           <span className="embedded-title">{title}</span>
+          {!readOnly && (
+            <>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('sub')}
+                title="Decrease — subtract an amount (−)"
+              >
+                −
+              </button>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('add')}
+                title="Increase — add an amount (+)"
+              >
+                +
+              </button>
+              <button
+                className="embedded-toggle"
+                disabled={selectedCellsCoords.length === 0}
+                onClick={() => openAdjust('mul')}
+                title="Multiply (×)"
+              >
+                ×
+              </button>
+            </>
+          )}
           <button 
             className={`embedded-toggle ${showColorShade ? 'active' : ''}`}
             onClick={() => setShowColorShade(!showColorShade)}
@@ -1313,6 +1399,15 @@ export default function TableEditor2D({
             aria-label="Toggle 3D View"
           >
             <Box size={14} />
+          </button>
+          <button
+            className={`embedded-toggle ${yAxisBottom ? 'active' : ''}`}
+            onClick={() => setTableYAxisBottom(!yAxisBottom)}
+            title={`Y axis zero at ${yAxisBottom ? 'bottom' : 'top'} - click to flip`}
+            aria-pressed={yAxisBottom}
+            aria-label="Y axis zero at bottom"
+          >
+            <ArrowUpDown size={14} />
           </button>
           {sizeInfo?.resizable && (
             <button
@@ -1377,6 +1472,15 @@ export default function TableEditor2D({
             >
               <span className="action-icon"><Box size={16} /></span>
             </button>
+            <button
+              className={`action-btn ${yAxisBottom ? 'active' : ''}`}
+              onClick={() => setTableYAxisBottom(!yAxisBottom)}
+              title={`Y axis zero at ${yAxisBottom ? 'bottom' : 'top'} - click to flip`}
+              aria-pressed={yAxisBottom}
+              aria-label="Y axis zero at bottom"
+            >
+              <span className="action-icon"><ArrowUpDown size={16} /></span>
+            </button>
             <button className="action-btn" onClick={handleSave} title="Save (S)">
               <Save size={18} />
             </button>
@@ -1391,9 +1495,9 @@ export default function TableEditor2D({
       {!embedded && (
         <TableToolbar
           onSetEqual={handleSetEqualWrapper}
-          onIncrease={handleIncrease}
-          onDecrease={handleDecrease}
-          onScale={handleScaleWrapper}
+          onIncrease={() => openAdjust('add')}
+          onDecrease={() => openAdjust('sub')}
+          onScale={() => openAdjust('mul')}
           onInterpolate={handleInterpolate}
           onSmooth={handleSmooth}
           onRebin={() => setRebinDialog({ ...rebinDialog, show: true })}
@@ -1407,6 +1511,8 @@ export default function TableEditor2D({
           canPaste={true}
           followMode={followMode}
           onFollowModeToggle={() => setFollowMode(!followMode)}
+          yAxisBottom={yAxisBottom}
+          onYAxisBottomToggle={() => setTableYAxisBottom(!yAxisBottom)}
           showColorShade={showColorShade}
           onColorShadeToggle={() => setShowColorShade(!showColorShade)}
           show3D={show3D}
@@ -1455,7 +1561,7 @@ export default function TableEditor2D({
           selectionRange={selectionRange}
           onSelectionChange={handleSelectionChange}
           onCellDoubleClick={handleCellDoubleClick}
-          historyTrail={showHistoryTrail ? historyTrail.map(([x, y]) => [x, y] as [number, number]) : []}
+          historyTrail={visibleHistoryTrail}
           lockedCells={lockedCells}
           onCellLock={handleCellLock}
           // Live cursor - maps realtime values to table position
@@ -1567,45 +1673,16 @@ export default function TableEditor2D({
         yAxisName={y_axis_name}
       />
 
-      <Dialog
-        open={scaleDialog.show}
-        onClose={() => setScaleDialog(prev => ({ ...prev, show: false }))}
-        size="sm"
-        title="Scale Selected Cells"
-      >
-        <Dialog.Body>
-          <FormField
-            label="Multiplier"
-            help={`Applied to ${selectedCellsCoords.length} selected cell(s). 1.05 = +5%, 0.95 = -5%.`}
-          >
-            {id => (
-              <input
-                id={id}
-                type="number"
-                step="any"
-                autoFocus
-                value={scaleDialog.factor}
-                onChange={e => setScaleDialog(prev => ({ ...prev, factor: e.target.value }))}
-                onKeyDown={e => {
-                  if (e.key === 'Enter') handleScaleDialogApply();
-                }}
-              />
-            )}
-          </FormField>
-        </Dialog.Body>
-        <Dialog.Footer>
-          <Button variant="secondary" onClick={() => setScaleDialog(prev => ({ ...prev, show: false }))}>
-            Cancel
-          </Button>
-          <Button
-            variant="primary"
-            onClick={handleScaleDialogApply}
-            disabled={!Number.isFinite(parseFloat(scaleDialog.factor))}
-          >
-            Apply
-          </Button>
-        </Dialog.Footer>
-      </Dialog>
+      <TableAdjustDialog
+        open={adjustDialog.show}
+        kind={adjustDialog.kind}
+        raw={adjustDialog.raw}
+        error={adjustDialog.error}
+        cellCount={selectedCellsCoords.length}
+        onChange={(raw) => setAdjustDialog((d) => ({ ...d, raw, error: null }))}
+        onClose={() => setAdjustDialog((d) => ({ ...d, show: false, error: null }))}
+        onApply={applyAdjust}
+      />
     </div>
   );
 }

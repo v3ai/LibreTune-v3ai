@@ -90,14 +90,40 @@ pub async fn update_constant_string(
             offset: constant.offset,
             data: raw_data,
         };
-        if let Err(e) = conn.write_memory(params) {
-            eprintln!("[WARN] Failed to write string constant to ECU: {}", e);
-        }
+        // A failed ECU write must not report success: the cache, `current_tune`
+        // and `tune_modified` are already committed at this point, so swallowing
+        // the error leaves the app's copy silently diverged from the ECU.
+        // Offline editing is the `conn_guard == None` case above, not this one.
+        conn.write_memory(params)
+            .map_err(|e| format!("Failed to write string constant '{name}' to ECU: {e}"))?;
     }
 
     eprintln!("Updated string constant '{}' to: '{}'", name, value);
 
     Ok(())
+}
+
+/// Snapshot the project's tune path plus the signature to stamp on it.
+///
+/// Lock order: `definition` **before** `current_project`, the convention
+/// `project_mgmt.rs` documents and `save_tune.rs` follows. Taking them the
+/// other way round (which `use_project_tune` used to do) closes an AB-BA
+/// cycle against `save_tune`, and `tokio::Mutex` is FIFO-fair so neither
+/// side yields. `definition` is released before `current_project` is taken,
+/// so the two are never held together at all.
+pub(crate) async fn project_tune_target(
+    state: &AppState,
+) -> Result<(std::path::PathBuf, String), String> {
+    let def_signature = {
+        let def_guard = state.definition.lock().await;
+        def_guard.as_ref().map(|d| d.signature.clone())
+    };
+
+    let project_guard = state.current_project.lock().await;
+    let project = project_guard.as_ref().ok_or("No project loaded")?;
+    let tune_path = project.current_tune_path();
+    let ini_signature = def_signature.unwrap_or_else(|| project.config.signature.clone());
+    Ok((tune_path, ini_signature))
 }
 
 /// Use LibreTune / project settings: merge MSQ constants onto the ECU base, save, write, burn.
@@ -108,19 +134,7 @@ pub async fn use_project_tune(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let (tune_path, ini_signature) = {
-        let project_guard = state.current_project.lock().await;
-        let project = project_guard.as_ref().ok_or("No project loaded")?;
-        let tune_path = project.current_tune_path();
-        let ini_signature = {
-            let def_guard = state.definition.lock().await;
-            def_guard
-                .as_ref()
-                .map(|d| d.signature.clone())
-                .unwrap_or_else(|| project.config.signature.clone())
-        };
-        (tune_path, ini_signature)
-    };
+    let (tune_path, ini_signature) = project_tune_target(&state).await?;
 
     let mut project_msq = if tune_path.exists() {
         TuneFile::load(&tune_path).map_err(|e| format!("Failed to load project tune: {}", e))?
@@ -180,101 +194,115 @@ pub async fn use_project_tune(
     let _ = app.emit("tune:loaded", "project");
 
     if state.connection.lock().await.is_some() {
-        let write_result = crate::commands::project_tune_sync::write_project_tune_to_ecu(
-            app.clone(),
-            state.clone(),
-        )
-        .await;
-        if let Err(e) = write_result {
-            let _ = crate::commands::realtime_stream::start_realtime_stream(
-                app.clone(),
-                state.clone(),
-                Some(50),
-            )
-            .await;
-            return Err(format!(
-                "Saved CurrentTune.msq, but failed to write to ECU: {}",
-                e
-            ));
-        }
-
-        // Loading an existing tune is not a pin-assignment action: the pin
-        // lint must not block persisting a tune the user already runs. Burn
-        // with force — interactive conflict resolution lives in BurnDialog,
-        // which surfaces the same scan with an explicit acknowledge-and-force
-        // checkbox before its own burn.
-        let burn_result =
-            crate::commands::tune_io::burn_to_ecu(app.clone(), state.clone(), Some(true)).await;
-        {
-            let mut conn_guard = state.connection.lock().await;
-            if let Some(conn) = conn_guard.as_mut() {
-                conn.clear_rx_buffer();
-            }
-        }
-        let _ = crate::commands::realtime_stream::start_realtime_stream(
-            app.clone(),
-            state.clone(),
-            Some(50),
-        )
-        .await;
-
-        burn_result.map_err(|e| {
-            format!(
-                "Saved CurrentTune.msq and wrote RAM, but burn failed: {}",
-                e
-            )
-        })
+        // write_project_tune_to_ecu writes every page, burns once, and
+        // restarts the realtime stream on both paths — do not burn again here.
+        //
+        // No pin-conflict scan runs on this path, matching the previous
+        // `burn_to_ecu(.., force = true)`: loading an existing tune is not a
+        // pin-assignment action, so the lint must not block persisting a tune
+        // the user already runs. Interactive conflict resolution lives in
+        // BurnDialog, which surfaces the same scan with an explicit
+        // acknowledge-and-force checkbox before its own burn.
+        crate::commands::project_tune_sync::write_project_tune_to_ecu(app.clone(), state.clone())
+            .await
+            .map_err(|e| format!("Saved CurrentTune.msq, but failed to write to ECU: {}", e))
     } else {
         Ok(())
     }
 }
 
 /// Use ECU settings: overwrite CurrentTune.msq on disk with the ECU tune.
+///
+/// Must use the mismatch snapshot's ECU pages. Saving via `save_tune_to_project`
+/// alone is wrong after a mismatch: cache/`current_tune` hold *project* pages,
+/// and stale MSQ constants are left in place. On the next connect those stale
+/// constants get re-applied whenever `<pageData>` is not exact-length-complete,
+/// so the mismatch dialog returns forever.
 #[tauri::command]
 pub async fn use_ecu_tune(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    {
-        let snapshot_guard = state.tune_mismatch_snapshot.lock().await;
-        if let Some(snapshot) = snapshot_guard.as_ref() {
-            let ini_signature = {
-                let def_guard = state.definition.lock().await;
-                def_guard
-                    .as_ref()
-                    .map(|d| d.signature.clone())
-                    .unwrap_or_default()
-            };
-            let mut cache_guard = state.tune_cache.lock().await;
-            if let Some(cache) = cache_guard.as_mut() {
-                for (page_num, page_data) in &snapshot.ecu_pages {
-                    cache.load_page(*page_num, page_data.clone());
-                }
-            }
-            drop(cache_guard);
+    let tune_path = {
+        let project_guard = state.current_project.lock().await;
+        project_guard
+            .as_ref()
+            .ok_or("No project loaded")?
+            .current_tune_path()
+    };
 
-            let mut tune_guard = state.current_tune.lock().await;
-            if let Some(tune) = tune_guard.as_mut() {
-                tune.pages = snapshot.ecu_pages.clone();
-                if !ini_signature.is_empty() {
-                    tune.signature = ini_signature;
-                }
-            } else {
-                let mut tune = TuneFile::new(ini_signature);
-                tune.pages = snapshot.ecu_pages.clone();
-                *tune_guard = Some(tune);
+    let ecu_pages = {
+        let snapshot_guard = state.tune_mismatch_snapshot.lock().await;
+        snapshot_guard
+            .as_ref()
+            .ok_or("No tune mismatch snapshot. Reconnect and sync, then choose Use ECU Settings.")?
+            .ecu_pages
+            .clone()
+    };
+
+    if ecu_pages.is_empty() {
+        return Err("ECU tune snapshot has no page data".to_string());
+    }
+
+    let (ini_signature, page_sizes) = {
+        let def_guard = state.definition.lock().await;
+        let def = def_guard.as_ref().ok_or("Definition not loaded")?;
+        (def.signature.clone(), def.page_sizes.clone())
+    };
+
+    let mut normalized = std::collections::HashMap::new();
+    for (page_num, mut page_data) in ecu_pages {
+        let expected = page_sizes
+            .get(page_num as usize)
+            .copied()
+            .unwrap_or(page_data.len() as u16) as usize;
+        if expected > 0 {
+            if page_data.len() < expected {
+                page_data.resize(expected, 0);
+            } else if page_data.len() > expected {
+                page_data.truncate(expected);
+            }
+        }
+        normalized.insert(page_num, page_data);
+    }
+
+    {
+        let mut cache_guard = state.tune_cache.lock().await;
+        if let Some(cache) = cache_guard.as_mut() {
+            for (page_num, page_data) in &normalized {
+                cache.load_page(*page_num, page_data.clone());
             }
         }
     }
 
-    *state.tune_modified.lock().await = false;
-    *state.tune_mismatch_snapshot.lock().await = None;
-
-    let has_project = state.current_project.lock().await.is_some();
-    if has_project {
-        crate::commands::project_tune_sync::save_tune_to_project(state.clone()).await?;
-        let _ = app.emit("tune:loaded", "ecu");
+    {
+        let mut tune_guard = state.current_tune.lock().await;
+        let pc_variables = tune_guard
+            .as_ref()
+            .map(|t| t.pc_variables.clone())
+            .unwrap_or_default();
+        let mut tune = TuneFile::new(&ini_signature);
+        tune.pages = normalized;
+        tune.pc_variables = pc_variables;
+        *tune_guard = Some(tune);
     }
 
+    *state.tune_mismatch_snapshot.lock().await = None;
+
+    crate::commands::save_tune::save_tune(
+        state.clone(),
+        Some(tune_path.to_string_lossy().to_string()),
+    )
+    .await?;
+
+    {
+        let saved = state.current_tune.lock().await.clone();
+        let mut project_guard = state.current_project.lock().await;
+        if let Some(project) = project_guard.as_mut() {
+            project.current_tune = saved;
+        }
+    }
+
+    let _ = app.emit("tune:loaded", "ecu");
     Ok(())
 }

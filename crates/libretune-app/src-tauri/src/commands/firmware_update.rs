@@ -2,6 +2,7 @@
 
 use crate::commands::metrics::stop_metrics_task;
 use crate::commands::tune_io::{resolve_controller_command, send_controller_command_bytes};
+use crate::commands::update_project_ini::update_project_ini;
 use crate::state::AppState;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -361,12 +362,17 @@ fn convert_bin_to_srec(bin_path: &Path, load_address: u32) -> Result<PathBuf, St
 /// Detect available external flash tools on the system.
 #[tauri::command]
 pub async fn get_firmware_flasher_info() -> Result<FirmwareFlasherInfo, String> {
-    Ok(FirmwareFlasherInfo {
-        stm32_programmer_cli: find_stm32_programmer_cli().map(|p| p.display().to_string()),
-        dfu_util: find_dfu_util().map(|p| p.display().to_string()),
-        bootcommander: find_bootcommander().map(|p| p.display().to_string()),
-        objcopy: find_objcopy().map(|p| p.display().to_string()),
+    // The find_* helpers shell out (`where` on Windows) and stat many
+    // directories, so they belong on a blocking worker too.
+    blocking_flash_step(|| {
+        Ok(FirmwareFlasherInfo {
+            stm32_programmer_cli: find_stm32_programmer_cli().map(|p| p.display().to_string()),
+            dfu_util: find_dfu_util().map(|p| p.display().to_string()),
+            bootcommander: find_bootcommander().map(|p| p.display().to_string()),
+            objcopy: find_objcopy().map(|p| p.display().to_string()),
+        })
     })
+    .await
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -379,6 +385,7 @@ pub struct FirmwareCompanionSuggestion {
 /// Optional hint when the user picks a firmware file.
 #[tauri::command]
 pub async fn suggest_firmware_companion(
+    state: tauri::State<'_, AppState>,
     firmware_path: String,
 ) -> Result<FirmwareCompanionSuggestion, String> {
     let path = PathBuf::from(&firmware_path);
@@ -387,7 +394,7 @@ pub async fn suggest_firmware_companion(
     }
 
     let ext = firmware_extension(&path);
-    let message = match ext.as_str() {
+    let mut message = match ext.as_str() {
         "bin" => {
             "rusefi.bin is the correct file for a normal serial update (same as rusEFI Console \
              and epicEFI). LibreTune converts it automatically for BootCommander."
@@ -404,11 +411,124 @@ pub async fn suggest_firmware_companion(
         _ => String::new(),
     };
 
+    let prefer = current_ini_prefer_prefix(&state).await;
+    let companion_path =
+        find_bundled_ini(&path, prefer.as_deref()).map(|p| p.display().to_string());
+    if let Some(ref ini) = companion_path {
+        let name = Path::new(ini)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ini.clone());
+        let note = format!(
+            " Found {name} next to the firmware — it will be copied into the project after a successful flash."
+        );
+        if message.is_empty() {
+            message = note.trim().to_string();
+        } else {
+            message.push_str(&note);
+        }
+    }
+
     Ok(FirmwareCompanionSuggestion {
-        companion_path: None,
+        companion_path,
         companion_kind: ext,
         message,
     })
+}
+
+fn ini_prefer_prefix(signature: Option<&str>) -> Option<String> {
+    let s = signature?.to_ascii_lowercase();
+    if s.contains("epicefi") || s.contains("epicecu") {
+        Some("epicefi".into())
+    } else if s.contains("rusefi") {
+        Some("rusefi".into())
+    } else if s.contains("speeduino") {
+        Some("speeduino".into())
+    } else if s.contains("fome") {
+        Some("fome".into())
+    } else {
+        None
+    }
+}
+
+async fn current_ini_prefer_prefix(state: &tauri::State<'_, AppState>) -> Option<String> {
+    let def = state.definition.lock().await;
+    def.as_ref()
+        .and_then(|d| ini_prefer_prefix(Some(d.signature.as_str())))
+}
+
+/// INI sitting next to a `.bin` / `.hex` in a firmware bundle.
+fn find_bundled_ini(firmware: &Path, prefer: Option<&str>) -> Option<PathBuf> {
+    let dir = firmware.parent()?;
+    let stem = firmware.file_stem()?.to_string_lossy().to_ascii_lowercase();
+    let mut inis: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.is_file()
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("ini"))
+        })
+        .collect();
+    if inis.is_empty() {
+        return None;
+    }
+    inis.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    let name = |p: &Path| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase()
+    };
+    if let Some(p) = inis.iter().find(|p| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case(&stem))
+    }) {
+        return Some(p.clone());
+    }
+    if let Some(pref) = prefer {
+        if let Some(p) = inis.iter().find(|p| name(p).starts_with(pref)) {
+            return Some(p.clone());
+        }
+    }
+    inis.into_iter().next()
+}
+
+async fn install_bundled_ini(
+    app: &AppHandle,
+    state: &tauri::State<'_, AppState>,
+    firmware: &Path,
+    log: &mut Vec<String>,
+) {
+    let prefer = current_ini_prefer_prefix(state).await;
+    let Some(ini) = find_bundled_ini(firmware, prefer.as_deref()) else {
+        return;
+    };
+    let name = ini
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ini.display().to_string());
+    match update_project_ini(
+        app.clone(),
+        state.clone(),
+        ini.to_string_lossy().into_owned(),
+        false,
+    )
+    .await
+    {
+        Ok(()) => push_log(
+            app,
+            log,
+            format!("Copied {name} from the firmware folder into the project."),
+        ),
+        Err(e) => push_log(
+            app,
+            log,
+            format!("Could not install bundled INI {name}: {e}"),
+        ),
+    }
 }
 
 fn resolve_bootloader_command(
@@ -430,6 +550,25 @@ fn resolve_bootloader_command(
             .ok_or_else(|| "This INI has no cmd_openblt controller command".to_string()),
         other => Err(format!("Unknown firmware update method: {}", other)),
     }
+}
+
+/// Run a synchronous flash step on a blocking worker.
+///
+/// The external flashers (`STM32_Programmer_CLI`, `dfu-util`, `BootCommander`,
+/// `arm-none-eabi-objcopy`) are driven with `std::process::Command::output()`,
+/// which parks the calling thread for the whole multi-minute flash. Called
+/// straight from an `async` Tauri command that parks a tokio worker thread;
+/// work-stealing migrates queued tasks off it, but the runtime loses a worker
+/// for the duration. Hand each step to `spawn_blocking` instead, where parking
+/// is what the pool is for.
+async fn blocking_flash_step<T, F>(step: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(step)
+        .await
+        .map_err(|e| format!("Firmware tool task failed: {e}"))?
 }
 
 fn run_command_capture(tool: &Path, args: &[&str]) -> Result<(bool, String), String> {
@@ -625,6 +764,8 @@ fn kill_stale_bootcommander_processes() {
 /// Free a blocked COM port after a failed firmware flash (e.g. stuck BootCommander).
 #[tauri::command]
 pub async fn release_serial_port_blockers(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    // Replacing `state.connection` is a transition like any other.
+    let _transition = state.connection_transition.lock().await;
     kill_stale_bootcommander_processes();
     stop_metrics_task(state.clone()).await;
     {
@@ -886,7 +1027,18 @@ pub async fn update_ecu_firmware(
     send_controller_command_bytes(&state, &bytes).await?;
 
     stop_metrics_task(state.clone()).await;
+    // Abort the realtime stream before dropping the connection, the same way
+    // `release_serial_port_blockers` and `disconnect_ecu` do. Left running, the
+    // stream sees `None` every tick and emits a `realtime:error` to the webview
+    // — ~20 per second at the 50 ms default, for the whole multi-minute flash.
     {
+        let mut task_guard = state.streaming_task.lock().await;
+        if let Some(handle) = task_guard.take() {
+            handle.abort();
+        }
+    }
+    {
+        let _transition = state.connection_transition.lock().await;
         let mut conn_guard = state.connection.lock().await;
         *conn_guard = None;
     }
@@ -913,10 +1065,18 @@ pub async fn update_ecu_firmware(
                 } else {
                     push_log(&app, &mut log, format!("Flashing with {}…", cli.display()));
                 }
-                flash_with_stm32_programmer(&cli, &path, resolved_bin_address)?
+                let firmware = path.clone();
+                blocking_flash_step(move || {
+                    flash_with_stm32_programmer(&cli, &firmware, resolved_bin_address)
+                })
+                .await?
             } else if let Some(tool) = find_dfu_util() {
                 push_log(&app, &mut log, format!("Flashing with {}…", tool.display()));
-                flash_with_dfu_util(&tool, &path, resolved_bin_address)?
+                let firmware = path.clone();
+                blocking_flash_step(move || {
+                    flash_with_dfu_util(&tool, &firmware, resolved_bin_address)
+                })
+                .await?
             } else {
                 return Err(
                     "No DFU flasher found. Install STM32CubeProgrammer (STM32_Programmer_CLI) or dfu-util and ensure it is on PATH.".to_string(),
@@ -952,7 +1112,8 @@ pub async fn update_ecu_firmware(
                         address
                     ),
                 );
-                convert_bin_to_srec(&path, address)?
+                let firmware = path.clone();
+                blocking_flash_step(move || convert_bin_to_srec(&firmware, address)).await?
             } else {
                 path.clone()
             };
@@ -967,7 +1128,11 @@ pub async fn update_ecu_firmware(
                     baud_rate
                 ),
             );
-            flash_with_bootcommander(&tool, &flash_path, &serial_port, baud_rate)?
+            let port_for_flash = serial_port.clone();
+            blocking_flash_step(move || {
+                flash_with_bootcommander(&tool, &flash_path, &port_for_flash, baud_rate)
+            })
+            .await?
         }
         other => return Err(format!("Unknown firmware update method: {}", other)),
     };
@@ -987,6 +1152,7 @@ pub async fn update_ecu_firmware(
     };
 
     push_log(&app, &mut log, message);
+    install_bundled_ini(&app, &state, &path, &mut log).await;
     Ok(FirmwareUpdateResult {
         success: true,
         log,
@@ -1091,6 +1257,7 @@ fn flash_recovery_with_stm32_programmer(
 #[tauri::command]
 pub async fn recover_ecu_firmware_dfu(
     app: AppHandle,
+    state: tauri::State<'_, AppState>,
     bootloader_path: String,
     app_firmware_path: String,
     app_flash_address: Option<String>,
@@ -1133,13 +1300,17 @@ pub async fn recover_ecu_firmware_dfu(
     );
 
     if full_erase {
-        let port = stm32_programmer_port(&cli);
+        let erase_cli = cli.clone();
+        let port = blocking_flash_step(move || Ok(stm32_programmer_port(&erase_cli))).await?;
         push_log(
             &app,
             &mut log,
             "Performing full chip erase (required on STM32F7)…",
         );
-        let erase_output = stm32_full_chip_erase(&cli, &port)?;
+        let erase_cli = cli.clone();
+        let erase_port = port.clone();
+        let erase_output =
+            blocking_flash_step(move || stm32_full_chip_erase(&erase_cli, &erase_port)).await?;
         for line in erase_output
             .lines()
             .map(str::trim)
@@ -1150,8 +1321,11 @@ pub async fn recover_ecu_firmware_dfu(
     }
 
     push_log(&app, &mut log, format!("Flashing with {}…", cli.display()));
-    let flash_output =
-        flash_recovery_with_stm32_programmer(&cli, &bootloader, &app_firmware, app_address, false)?;
+    let app_for_flash = app_firmware.clone();
+    let flash_output = blocking_flash_step(move || {
+        flash_recovery_with_stm32_programmer(&cli, &bootloader, &app_for_flash, app_address, false)
+    })
+    .await?;
     for line in flash_output
         .lines()
         .map(str::trim)
@@ -1162,10 +1336,65 @@ pub async fn recover_ecu_firmware_dfu(
 
     let message = "Recovery flash complete. Disconnect USB, power-cycle the ECU, then reconnect in normal mode.";
     push_log(&app, &mut log, message);
+    install_bundled_ini(&app, &state, &app_firmware, &mut log).await;
     Ok(FirmwareUpdateResult {
         success: true,
         log,
         message: message.to_string(),
         should_reconnect: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn write(dir: &Path, name: &str) -> PathBuf {
+        let p = dir.join(name);
+        fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    #[test]
+    fn bundled_ini_same_stem_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write(dir.path(), "rusefi.bin");
+        write(dir.path(), "epicefi_board.ini");
+        write(dir.path(), "rusefi.ini");
+        let found = find_bundled_ini(&bin, Some("epicefi")).unwrap();
+        assert_eq!(found.file_name().unwrap(), "rusefi.ini");
+    }
+
+    #[test]
+    fn bundled_ini_prefers_signature_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write(dir.path(), "rusefi.bin");
+        write(dir.path(), "epicefi_alphax-8chan.ini");
+        write(dir.path(), "rusefi_alphax-8chan.ini");
+        let found = find_bundled_ini(&bin, Some("epicefi")).unwrap();
+        assert_eq!(found.file_name().unwrap(), "epicefi_alphax-8chan.ini");
+        let found = find_bundled_ini(&bin, Some("rusefi")).unwrap();
+        assert_eq!(found.file_name().unwrap(), "rusefi_alphax-8chan.ini");
+    }
+
+    #[test]
+    fn bundled_ini_none_without_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = write(dir.path(), "rusefi.bin");
+        assert!(find_bundled_ini(&bin, Some("epicefi")).is_none());
+    }
+
+    #[test]
+    fn ini_prefer_prefix_from_signature() {
+        assert_eq!(
+            ini_prefer_prefix(Some("epicEFI master.2026.09.02.epicECUv1.1")).as_deref(),
+            Some("epicefi")
+        );
+        assert_eq!(
+            ini_prefer_prefix(Some("rusEFI master.2026.09.02")).as_deref(),
+            Some("rusefi")
+        );
+    }
 }

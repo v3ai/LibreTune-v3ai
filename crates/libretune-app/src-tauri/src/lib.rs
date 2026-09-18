@@ -83,8 +83,8 @@ use commands::dash_layout::{
     reset_dashboards_to_defaults,
 };
 use commands::data_logging::{
-    clear_log, get_log_entries, get_logging_status, read_text_file, save_log, start_logging,
-    stop_logging, write_text_file,
+    clear_log, get_log_entries, get_logging_status, load_log_file, read_text_file, save_log,
+    start_logging, stop_logging, write_text_file,
 };
 use commands::debug_realtime::debug_single_realtime_read;
 use commands::demo::{get_demo_mode, set_demo_mode};
@@ -138,8 +138,7 @@ use commands::project_mgmt::{
 };
 use commands::project_misc::{delete_project, get_msq_info};
 use commands::project_tune_sync::{
-    compare_project_and_ecu_tunes, mark_tune_modified, save_tune_to_project,
-    write_project_tune_to_ecu,
+    mark_tune_modified, save_tune_to_project, write_project_tune_to_ecu,
 };
 use commands::realtime_get::get_realtime_data;
 use commands::realtime_stop::stop_realtime_stream;
@@ -149,9 +148,8 @@ use commands::restore_points::{
 };
 use commands::save_tune::{save_tune, save_tune_as};
 use commands::sensor_calibration::{
-    auto_calibrate_afr, build_thermistor_curve, get_temperature_calibration_bins,
-    list_calibration_presets, preview_afr_calibration, write_afr_calibration,
-    write_temperature_calibration,
+    build_thermistor_curve, get_temperature_calibration_bins, list_calibration_presets,
+    preview_afr_calibration, write_afr_calibration, write_temperature_calibration,
 };
 use commands::settings::{
     get_settings, update_heatmap_custom_stops, update_setting, update_settings,
@@ -177,6 +175,7 @@ use commands::tune_migration::{
     clear_migration_report, get_migration_report, get_tune_constant_manifest, get_tune_ini_metadata,
 };
 use commands::tune_misc::{update_constant_string, use_ecu_tune, use_project_tune};
+use commands::tune_mismatch_view::{get_tune_mismatch_dialog_index, get_tune_mismatch_dialog_view};
 use commands::update_project_ini::update_project_ini;
 use commands::wasm_plugin::{
     execute_wasm_plugin, get_wasm_plugin_info, list_wasm_plugins, load_wasm_plugin,
@@ -213,6 +212,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             connection: Mutex::new(None),
+            connection_transition: Mutex::new(()),
+            connection_generation: std::sync::atomic::AtomicU64::new(0),
             definition: Mutex::new(None),
             autotune_state: Mutex::new(AutoTuneState::new()),
             autotune_secondary_state: Mutex::new(AutoTuneState::new()),
@@ -250,6 +251,8 @@ pub fn run() {
             get_available_inis,
             connect_to_ecu,
             sync_ecu_data,
+            get_tune_mismatch_dialog_index,
+            get_tune_mismatch_dialog_view,
             disconnect_ecu,
             enable_adaptive_timing,
             disable_adaptive_timing,
@@ -322,11 +325,6 @@ pub fn run() {
             commands::autotune_preflight::save_delay_model,
             commands::temperature_units::get_temperature_units_status,
             commands::temperature_units::set_temperature_units,
-            commands::autotune_preflight::preflight_autotune,
-            commands::analyze_filters::get_declared_analyze_filters,
-            commands::autotune_export::build_autotune_proposal,
-            commands::autotune_export::save_autotune_proposal,
-            commands::autotune_preflight::save_delay_model,
             get_autotune_recommendations,
             get_autotune_heatmap,
             send_autotune_recommendations,
@@ -387,7 +385,6 @@ pub fn run() {
             get_temperature_calibration_bins,
             list_calibration_presets,
             preview_afr_calibration,
-            auto_calibrate_afr,
             build_thermistor_curve,
             write_temperature_calibration,
             write_afr_calibration,
@@ -400,7 +397,6 @@ pub fn run() {
             use_project_tune,
             use_ecu_tune,
             mark_tune_modified,
-            compare_project_and_ecu_tunes,
             write_project_tune_to_ecu,
             save_tune_to_project,
             // Tune cache commands
@@ -413,6 +409,7 @@ pub fn run() {
             get_log_entries,
             clear_log,
             save_log,
+            load_log_file,
             read_text_file,
             write_text_file,
             // Diagnostic commands (stubs)
@@ -424,6 +421,7 @@ pub fn run() {
             commands::tooth_logger::list_diagnostic_loggers,
             commands::ini_meta::list_tunable_tables,
             commands::analyse_log::analyse_log,
+            commands::analyse_log::analyse_log_file,
             compare_tables,
             reset_tune_to_defaults,
             export_tune_as_csv,

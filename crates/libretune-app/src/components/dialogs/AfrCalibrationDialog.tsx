@@ -3,23 +3,15 @@
  *
  * Builds the 1024-entry ADC→AFR transfer curve for Speeduino's O2
  * calibration space and writes it through the dedicated `t` calibration
- * command. Everything numeric happens on the backend: the preset list, the
- * curve and the auto-calibration all come from the loaded INI via
- * `list_calibration_presets` / `preview_afr_calibration`, so a different
- * firmware — or a MegaSquirt INI — brings its own presets instead of a list
- * hardcoded here.
- *
- * "Detect from sensor power-on" is the thing TunerStudio cannot do. A
- * 14Point7 Spartan 2 drives two known voltages for ~5 s each at power-on;
- * recording the AFR channel across a sensor power cycle and handing it to
- * `auto_calibrate_afr` recovers the wiring error (mostly ground offset) and
- * fills the two-point editor with the corrected calibration.
+ * command. Everything numeric happens on the backend: the preset list and
+ * the curve both come from the loaded INI via `list_calibration_presets` /
+ * `preview_afr_calibration`, so a different firmware — or a MegaSquirt INI —
+ * brings its own presets instead of a list hardcoded here.
  */
 
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Dialog, Button } from "../common";
-import { useRealtimeStore } from "../../stores/realtimeStore";
 import "./AfrCalibrationDialog.css";
 
 interface AfrCalibrationDialogProps {
@@ -54,14 +46,6 @@ interface AfrCurve {
   clips: boolean;
 }
 
-interface AutoCalResult {
-  point1: [number, number];
-  point2: [number, number];
-  ground_offset_volts: number;
-  offset_consistency_volts: number;
-  description: string;
-}
-
 interface CalibrationWriteResult {
   table: string;
   verified: boolean;
@@ -71,13 +55,6 @@ interface CalibrationWriteResult {
 
 const CUSTOM = "custom";
 
-/** Seconds of live AFR recorded for the sensor's power-on self-test. The two
- *  plateaus are ~5 s each; the rest is slack for reaching the key. */
-const CAPTURE_SECONDS = 20;
-
-/** Live channel carrying the wideband reading. */
-const AFR_CHANNEL = "afr";
-
 const STORAGE_KEY = "lt.afrCalibration";
 
 interface StoredSettings {
@@ -86,6 +63,11 @@ interface StoredSettings {
   customAfr1: number;
   customV2: number;
   customAfr2: number;
+  corrMode: "off" | "one" | "two";
+  corrM1: number;
+  corrE1: number;
+  corrM2: number;
+  corrE2: number;
 }
 
 function loadStored(): Partial<StoredSettings> {
@@ -95,8 +77,6 @@ function loadStored(): Partial<StoredSettings> {
     return {};
   }
 }
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export default function AfrCalibrationDialog({
   isOpen,
@@ -114,9 +94,16 @@ export default function AfrCalibrationDialog({
   const [customAfr1, setCustomAfr1] = useState(stored.customAfr1 ?? 10);
   const [customV2, setCustomV2] = useState(stored.customV2 ?? 5);
   const [customAfr2, setCustomAfr2] = useState(stored.customAfr2 ?? 20);
+  /** Reference correction over the selected base curve. "off" hides the
+   *  section; one point corrects offset only; two solve gain and offset. */
+  const [corrMode, setCorrMode] = useState<"off" | "one" | "two">(
+    stored.corrMode ?? "off",
+  );
+  const [corrM1, setCorrM1] = useState(stored.corrM1 ?? 14.2);
+  const [corrE1, setCorrE1] = useState(stored.corrE1 ?? 14.7);
+  const [corrM2, setCorrM2] = useState(stored.corrM2 ?? 19.0);
+  const [corrE2, setCorrE2] = useState(stored.corrE2 ?? 18.25);
   const [curve, setCurve] = useState<AfrCurve | null>(null);
-  const [autoCal, setAutoCal] = useState<AutoCalResult | null>(null);
-  const [captureLeft, setCaptureLeft] = useState(0);
   const [writing, setWriting] = useState(false);
   const [writeResult, setWriteResult] = useState<CalibrationWriteResult | null>(null);
   /** Command failures. Never swallowed: a dialog that reports success while
@@ -124,7 +111,7 @@ export default function AfrCalibrationDialog({
    *  `error` so a preview that succeeds cannot hide a preset list that did
    *  not load. */
   const [presetsError, setPresetsError] = useState<string | null>(null);
-  /** Last preview / auto-cal / write failure. */
+  /** Last preview / write failure. */
   const [error, setError] = useState<string | null>(null);
 
   const isCustom = presetId === CUSTOM;
@@ -177,9 +164,18 @@ export default function AfrCalibrationDialog({
   useEffect(() => {
     if (!isOpen || !presetId) return;
     let live = true;
+    const correction =
+      corrMode === "one"
+        ? [[corrM1, corrE1]]
+        : corrMode === "two"
+          ? [
+              [corrM1, corrE1],
+              [corrM2, corrE2],
+            ]
+          : undefined;
     const args = isCustom
-      ? { linear: [[customV1, customAfr1], [customV2, customAfr2]] }
-      : { preset: presetId };
+      ? { linear: [[customV1, customAfr1], [customV2, customAfr2]], correction }
+      : { preset: presetId, correction };
     invoke<AfrCurve>("preview_afr_calibration", args)
       .then((c) => {
         if (!live) return;
@@ -194,7 +190,7 @@ export default function AfrCalibrationDialog({
     return () => {
       live = false;
     };
-  }, [isOpen, presetId, isCustom, customV1, customAfr1, customV2, customAfr2]);
+  }, [isOpen, presetId, isCustom, customV1, customAfr1, customV2, customAfr2, corrMode, corrM1, corrE1, corrM2, corrE2]);
 
   const previewPath = useMemo(() => {
     if (!curve) return "";
@@ -211,56 +207,6 @@ export default function AfrCalibrationDialog({
       .join(" ");
   }, [curve]);
 
-  /** Record the live AFR channel across a sensor power cycle and solve the
-   *  corrected two-point calibration from the startup plateaus. */
-  async function handleDetect() {
-    if (!curve) return;
-    setError(null);
-    setAutoCal(null);
-    const t0 = Date.now();
-    const samples: [number, number][] = [];
-    // Subscribe on the update timestamp, not on the AFR value: during a
-    // plateau the value is constant, and a value-keyed subscription would
-    // record one sample for the whole window instead of a flat run.
-    const unsubscribe = useRealtimeStore.subscribe(
-      (s) => s.lastUpdateTime,
-      () => {
-        const afr = useRealtimeStore.getState().channels[AFR_CHANNEL];
-        if (Number.isFinite(afr)) samples.push([(Date.now() - t0) / 1000, afr]);
-      },
-    );
-    try {
-      for (let left = CAPTURE_SECONDS; left > 0; left--) {
-        setCaptureLeft(left);
-        await sleep(1000);
-      }
-    } finally {
-      unsubscribe();
-      setCaptureLeft(0);
-    }
-    if (samples.length === 0) {
-      setError(
-        "No AFR samples arrived during the recording — the ECU was not " +
-          "streaming, or the log has no 'afr' channel.",
-      );
-      return;
-    }
-    try {
-      const result = await invoke<AutoCalResult>("auto_calibrate_afr", {
-        samples,
-        currentCurve: curve.afr,
-      });
-      setAutoCal(result);
-      setPresetId(CUSTOM);
-      setCustomV1(result.point1[0]);
-      setCustomAfr1(result.point1[1]);
-      setCustomV2(result.point2[0]);
-      setCustomAfr2(result.point2[1]);
-    } catch (e) {
-      setError(`Auto-calibration failed: ${e}`);
-    }
-  }
-
   async function handleWrite() {
     if (!curve) return;
     setWriting(true);
@@ -275,6 +221,11 @@ export default function AfrCalibrationDialog({
           customAfr1,
           customV2,
           customAfr2,
+          corrMode,
+          corrM1,
+          corrE1,
+          corrM2,
+          corrE2,
         } satisfies StoredSettings),
       );
       const result = await invoke<CalibrationWriteResult>("write_afr_calibration", {
@@ -297,7 +248,6 @@ export default function AfrCalibrationDialog({
   }
 
   const fmt = (v: number) => v.toFixed(2);
-  const capturing = captureLeft > 0;
 
   return (
     <Dialog open={isOpen} onClose={onClose} title="Calibrate AFR Sensor" size="md">
@@ -371,29 +321,74 @@ export default function AfrCalibrationDialog({
         )}
 
         <div className="afrcal-field">
-          <Button
-            variant="secondary"
-            onClick={handleDetect}
-            disabled={!connected || !curve || capturing || writing}
+          <label htmlFor="afrcal-corr">Correct against a reference</label>
+          <select
+            id="afrcal-corr"
+            value={corrMode}
+            onChange={(e) => setCorrMode(e.target.value as "off" | "one" | "two")}
           >
-            {capturing
-              ? `Recording… ${captureLeft}s — power-cycle the sensor now`
-              : "Detect from sensor power-on"}
-          </Button>
-          <span className="afrcal-hint">
-            Records {CAPTURE_SECONDS}s of the live AFR channel. Start it, then
-            cycle power to the wideband: its two startup plateaus are
-            sensor-generated, so the difference between what it sent and what
-            the ECU read is the wiring error. Needs the ECU streaming.
-          </span>
+            <option value="off">Off — use the curve as-is</option>
+            <option value="one">Single point (offset)</option>
+            <option value="two">Two point (gain + offset)</option>
+          </select>
+          {corrMode !== "off" && (
+            <span className="afrcal-hint">
+              Measured is what the ECU shows on this curve; expected is what a
+              trusted reference reads at the same moment — the controller's own
+              gauge, a second meter, or span gas. One point shifts the whole
+              curve; two points also correct an error that grows across the
+              range. The corrected curve is what previews and writes.
+            </span>
+          )}
         </div>
 
-        {autoCal && (
-          <p className="afrcal-result">
-            {autoCal.description}
-            {Math.abs(autoCal.offset_consistency_volts) > 0.05 &&
-              " — the two plateaus disagree, so this is not a simple ground offset; check the fit before writing."}
-          </p>
+        {corrMode !== "off" && (
+          <div className="afrcal-custom-grid">
+            <div className="afrcal-field">
+              <label htmlFor="afrcal-corrm1">{corrMode === "two" ? "Point 1 measured (ECU)" : "Measured (ECU)"}</label>
+              <input
+                id="afrcal-corrm1"
+                type="number"
+                step="0.01"
+                value={corrM1}
+                onChange={(e) => setCorrM1(parseFloat(e.target.value) || 0)}
+              />
+            </div>
+            <div className="afrcal-field">
+              <label htmlFor="afrcal-corre1">{corrMode === "two" ? "Point 1 expected (reference)" : "Expected (reference)"}</label>
+              <input
+                id="afrcal-corre1"
+                type="number"
+                step="0.01"
+                value={corrE1}
+                onChange={(e) => setCorrE1(parseFloat(e.target.value) || 0)}
+              />
+            </div>
+            {corrMode === "two" && (
+              <>
+                <div className="afrcal-field">
+                  <label htmlFor="afrcal-corrm2">Point 2 measured (ECU)</label>
+                  <input
+                    id="afrcal-corrm2"
+                    type="number"
+                    step="0.01"
+                    value={corrM2}
+                    onChange={(e) => setCorrM2(parseFloat(e.target.value) || 0)}
+                  />
+                </div>
+                <div className="afrcal-field">
+                  <label htmlFor="afrcal-corre2">Point 2 expected (reference)</label>
+                  <input
+                    id="afrcal-corre2"
+                    type="number"
+                    step="0.01"
+                    value={corrE2}
+                    onChange={(e) => setCorrE2(parseFloat(e.target.value) || 0)}
+                  />
+                </div>
+              </>
+            )}
+          </div>
         )}
 
         <div className="afrcal-preview">
@@ -443,7 +438,7 @@ export default function AfrCalibrationDialog({
         <Button
           variant="primary"
           onClick={handleWrite}
-          disabled={!connected || writing || capturing || !curve}
+          disabled={!connected || writing || !curve}
         >
           {writing ? "Writing…" : "Write Calibration"}
         </Button>

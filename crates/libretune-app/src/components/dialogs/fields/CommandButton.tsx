@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertTriangle } from 'lucide-react';
 import { useToast } from '../../../contexts/ToastContext';
+import { useChannels } from '../../../stores/realtimeStore';
 import type { DialogComponent } from '../types';
+import { useDialogValueSource } from '../DialogValueSource';
 
 // Settings key for command warning preference
 const COMMAND_WARNINGS_DISABLED_KEY = 'libretune_command_warnings_disabled';
@@ -17,6 +19,13 @@ export function CommandButton({
   comp: DialogComponent;
   context: Record<string, number>;
 }) {
+  const readOnly = !!useDialogValueSource()?.readOnly;
+  const liveNames = useMemo(() => {
+    const src = `${comp.enabled_condition ?? ''} ${comp.label ?? ''}`;
+    return [...new Set(Array.from(src.matchAll(/\b([A-Za-z_]\w*)\b/g), (m) => m[1]))];
+  }, [comp.enabled_condition, comp.label]);
+  const live = useChannels(liveNames);
+  const merged = useMemo(() => ({ ...context, ...live }), [context, live]);
   const [isEnabled, setIsEnabled] = useState(true);
   const [isExecuting, setIsExecuting] = useState(false);
   const [showWarning, setShowWarning] = useState(false);
@@ -34,13 +43,13 @@ export function CommandButton({
       setDisplayLabel('');
       return;
     }
-    invoke<string>('evaluate_string_expression', { expression: comp.label, context })
+    invoke<string>('evaluate_string_expression', { expression: comp.label, context: merged })
       .then(setDisplayLabel)
       .catch((err) => {
         console.error('Error evaluating command button label:', err);
         setDisplayLabel(comp.label ?? '');
       });
-  }, [comp.label, context]);
+  }, [comp.label, merged]);
 
   // Load warning preference from localStorage
   useEffect(() => {
@@ -53,14 +62,14 @@ export function CommandButton({
   // Evaluate enable condition
   useEffect(() => {
     if (comp.enabled_condition) {
-      invoke<boolean>('evaluate_expression', { expression: comp.enabled_condition, context })
+      invoke<boolean>('evaluate_expression', { expression: comp.enabled_condition, context: merged })
         .then(setIsEnabled)
         .catch((err) => {
           console.error('Error evaluating command button condition:', err);
           setIsEnabled(true); // Default to enabled on error
         });
     }
-  }, [comp.enabled_condition, context]);
+  }, [comp.enabled_condition, merged]);
 
   const executeCommand = async () => {
     if (!comp.command || isExecuting) return;
@@ -115,7 +124,7 @@ export function CommandButton({
         <button
           className={`command-button ${isExecuting ? 'executing' : ''}`}
           onClick={handleClick}
-          disabled={!isEnabled || isExecuting}
+          disabled={!isEnabled || isExecuting || readOnly}
         >
           {isExecuting ? 'Executing...' : displayLabel}
         </button>

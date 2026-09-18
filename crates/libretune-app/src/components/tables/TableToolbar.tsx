@@ -17,13 +17,14 @@ import {
   Wand2,
   Upload,
   Download,
-  Bot
+  Bot,
+  ArrowUpDown
 } from 'lucide-react';
 
 interface TableToolbarProps {
   onSetEqual: () => void;
-  onIncrease: (amount: number) => void;
-  onDecrease: (amount: number) => void;
+  onIncrease: () => void;
+  onDecrease: () => void;
   onScale: () => void;
   onInterpolate: () => void;
   onSmooth: () => void;
@@ -38,6 +39,9 @@ interface TableToolbarProps {
   canPaste: boolean;
   followMode?: boolean;
   onFollowModeToggle?: () => void;
+  /** Y axis zero at bottom (rows reversed). Toggles the global table_y_axis_bottom setting. */
+  yAxisBottom?: boolean;
+  onYAxisBottomToggle?: () => void;
   showColorShade?: boolean;
   onColorShadeToggle?: () => void;
   show3D?: boolean;
@@ -70,6 +74,8 @@ export default function TableToolbar({
   canPaste,
   followMode = false,
   onFollowModeToggle,
+  yAxisBottom = false,
+  onYAxisBottomToggle,
   showColorShade = false,
   onColorShadeToggle,
   show3D = false,
@@ -94,16 +100,16 @@ export default function TableToolbar({
         </button>
         <button 
           className="ts-toolbar-btn" 
-          title="Increase by 1% (> or .)"
-          onClick={() => onIncrease(0.01)}
+          title="Increase — add an amount (+)"
+          onClick={onIncrease}
         >
           <Plus size={14} />
           <span className="ts-toolbar-key">&gt;</span>
         </button>
         <button 
           className="ts-toolbar-btn" 
-          title="Decrease by 1% (<)"
-          onClick={() => onDecrease(0.01)}
+          title="Decrease — subtract an amount (−)"
+          onClick={onDecrease}
         >
           <Minus size={14} />
           <span className="ts-toolbar-key">&lt;</span>
@@ -116,7 +122,7 @@ export default function TableToolbar({
       <div className="ts-toolbar-group">
         <button 
           className="ts-toolbar-btn" 
-          title="Scale selected cells (*)"
+          title="Multiply selected cells (×)"
           onClick={onScale}
         >
           <X size={14} />
@@ -226,6 +232,17 @@ export default function TableToolbar({
             onClick={onColorShadeToggle}
           >
             <Palette size={14} />
+          </button>
+        )}
+        {onYAxisBottomToggle && (
+          <button
+            className={`ts-toolbar-btn ${yAxisBottom ? 'ts-toolbar-btn-active' : ''}`}
+            title={yAxisBottom ? 'Y axis: zero at bottom (click for zero at top)' : 'Y axis: zero at top (click for zero at bottom)'}
+            onClick={onYAxisBottomToggle}
+            aria-pressed={yAxisBottom}
+            aria-label="Y axis zero at bottom"
+          >
+            <ArrowUpDown size={14} />
           </button>
         )}
         {onToggle3D && (

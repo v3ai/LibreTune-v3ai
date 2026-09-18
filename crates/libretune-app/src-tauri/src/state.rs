@@ -21,6 +21,7 @@ use libretune_core::tune::{MigrationReport, TuneCache, TuneFile};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -207,8 +208,34 @@ pub struct AutoTuneConfig {
     pub strict_lambda_match: bool,
 }
 
+/// # AutoTune lock order
+///
+/// Any code path that holds more than one of the AutoTune mutexes at once
+/// **must** acquire them in this order:
+///
+/// `autotune_config` -> `autotune_state` -> `autotune_secondary_state`
+///
+/// `get_autotune_status` reads the config then the state; `stop_autotune`
+/// used to take them the other way round, which deadlocked when the two ran
+/// concurrently. Acquiring in a different order is only safe when the earlier
+/// guard is dropped before the next lock is taken (as `feed_autotune_data`
+/// does).
 pub struct AppState {
     pub connection: Mutex<Option<Connection>>,
+    /// Serialises everything that *replaces* [`AppState::connection`].
+    ///
+    /// Holding the connection lock is not enough: entering demo mode and
+    /// connecting to real hardware each take it several times, and between
+    /// those acquisitions the other can install its own connection. The
+    /// result is demo mode's definition and tune sitting over a physical
+    /// ECU, or a real connection torn down by a demo transition that had
+    /// already checked the flag. Take this for the whole transition.
+    pub connection_transition: Mutex<()>,
+    /// Bumped by every disconnect. `connect_to_ecu` reads it before its
+    /// handshake and refuses to install the connection if it changed, so a
+    /// disconnect that gave up waiting on `connection_transition` (Issue #71)
+    /// cannot be undone by the connect it raced.
+    pub connection_generation: AtomicU64,
     pub definition: Mutex<Option<EcuDefinition>>,
     pub autotune_state: Mutex<AutoTuneState>,
     pub autotune_secondary_state: Mutex<AutoTuneState>,
@@ -298,6 +325,44 @@ mod tests {
     }
 }
 
+/// Cancellation handle of the live ECU connection (Issue #71).
+///
+/// `disconnect_ecu` has to raise this flag *before* it waits for
+/// `AppState::connection`, because the task it is trying to interrupt is the
+/// one holding that mutex, parked in a blocking read. The handle therefore
+/// cannot live behind the same mutex.
+///
+/// It is a module-level cell rather than an `AppState` field so the eight
+/// `AppState { .. }` literals across this crate stay untouched; there is one
+/// managed `AppState` per process, so the scope is the same either way.
+static ECU_CANCEL: std::sync::Mutex<Option<Arc<AtomicBool>>> = std::sync::Mutex::new(None);
+
+fn ecu_cancel_slot() -> std::sync::MutexGuard<'static, Option<Arc<AtomicBool>>> {
+    // A panic while swapping an Arc cannot leave the slot inconsistent, so a
+    // poisoned lock is still safe to use.
+    ECU_CANCEL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Remember the connection's cancel handle. Called once the connection is
+/// established, before it moves into `AppState::connection`.
+pub fn set_ecu_cancel_handle(handle: Arc<AtomicBool>) {
+    *ecu_cancel_slot() = Some(handle);
+}
+
+/// Ask any in-flight blocking ECU read to abort. No-op when nothing is
+/// connected.
+pub fn request_ecu_cancel() {
+    if let Some(handle) = ecu_cancel_slot().as_ref() {
+        handle.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Forget the handle once the connection has been dropped, so a later
+/// disconnect cannot raise a flag belonging to a connection that is gone.
+pub fn clear_ecu_cancel_handle() {
+    *ecu_cancel_slot() = None;
+}
+
 impl AppState {
     /// Epoch seconds at process start (for `timeNow()`).
     pub fn process_start_epoch() -> f64 {
@@ -315,6 +380,8 @@ impl AppState {
 
 #[derive(Clone, Debug)]
 pub struct TuneMismatchSnapshot {
+    /// Materialized project pages (ECU base + MSQ constants) at mismatch time.
+    pub project_pages: HashMap<u8, Vec<u8>>,
     /// ECU page images captured at mismatch time (base for safe project merge).
     pub ecu_pages: HashMap<u8, Vec<u8>>,
 }

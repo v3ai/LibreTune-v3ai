@@ -8,10 +8,13 @@ import { useGraphLogStore, exportGraphLogSetup, importGraphLogSetup } from '../.
 import LoggerStatsPanel from './LoggerStatsPanel';
 import GraphLog, { GraphSample } from './GraphLog';
 import { parseLogFile } from '../../utils/parseLogFile';
+import { minMax } from '../../utils/minMax';
+import { nearestIndex } from '../../utils/nearestIndex';
+import { incrementalMap, type IncrementalMapCache } from '../../utils/incrementalMap';
 import './DataLogView.css';
 
 /** Hard cap on samples kept in the frontend; the oldest are dropped beyond it. */
-const MAX_FRONTEND_SAMPLES = 100_000;
+const MAX_FRONTEND_SAMPLES = 4096;
 
 interface LoggingStatus {
   is_recording: boolean;
@@ -112,9 +115,11 @@ const LineChart: React.FC<{
       const channelData = data.map(d => d.values[channel]).filter(v => v !== undefined);
       if (channelData.length < 2) return;
       
-      // Auto-scale for this channel
-      const minVal = Math.min(...channelData);
-      const maxVal = Math.max(...channelData);
+      // Auto-scale for this channel. A plain loop (via minMax) instead of
+      // Math.min/max(...channelData) — the cap on channelData is
+      // MAX_FRONTEND_SAMPLES (100k), close enough to the ~110k call-stack
+      // limit for a spread that it must not be spread.
+      const { min: minVal, max: maxVal } = minMax(channelData);
       const range = maxVal - minVal || 1;
       const scale = chartHeight / range;
       
@@ -294,8 +299,8 @@ export const DataLogView: React.FC = () => {
         const st = await invoke<LoggingStatus>('get_logging_status');
         if (st.entry_count === 0) return;
         const entries = await invoke<LogEntry[]>('get_log_entries', {
-          startIndex: 0,
-          count: st.entry_count,
+          startIndex: Math.max(0, st.entry_count - MAX_FRONTEND_SAMPLES),
+          count: MAX_FRONTEND_SAMPLES,
           channels: neededChannelsRef.current
         });
         setLogData(entries.map(e => ({ x: e.timestamp_ms, values: e.values })));
@@ -332,8 +337,8 @@ export const DataLogView: React.FC = () => {
           setIsRecording(true);
           if (st.entry_count > 0) {
             const entries = await invoke<LogEntry[]>('get_log_entries', {
-              startIndex: 0,
-              count: st.entry_count,
+              startIndex: Math.max(0, st.entry_count - MAX_FRONTEND_SAMPLES),
+              count: MAX_FRONTEND_SAMPLES,
               channels: neededChannelsRef.current,
             });
             setLogData(entries.map((e) => ({ x: e.timestamp_ms, values: e.values })));
@@ -343,7 +348,6 @@ export const DataLogView: React.FC = () => {
         // not connected / no logger yet
       }
     })();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   
   // Seed channel list once when ECU data first arrives (avoid subscribing to all channels at 20Hz).
@@ -446,7 +450,7 @@ export const DataLogView: React.FC = () => {
       });
       if (!path) return;
       const setup = exportGraphLogSetup(sampleRate);
-      await invoke('write_text_file', { path, contents: JSON.stringify(setup, null, 2) });
+      await invoke('write_file_contents', { path, content: JSON.stringify(setup, null, 2) });
     } catch (err) {
       console.error('Failed to export setup:', err);
       alert(`Failed to export setup: ${err}`);
@@ -460,7 +464,7 @@ export const DataLogView: React.FC = () => {
         multiple: false
       });
       if (!path || Array.isArray(path)) return;
-      const text = await invoke<string>('read_text_file', { path });
+      const text = await invoke<string>('read_file_contents', { path });
       const data = JSON.parse(text);
       const error = importGraphLogSetup(data);
       if (error) {
@@ -484,8 +488,8 @@ export const DataLogView: React.FC = () => {
       const p2 = (x: number) => String(x).padStart(2, '0');
       const stamp = `${n.getFullYear()}-${p2(n.getMonth() + 1)}-${p2(n.getDate())}_${p2(n.getHours())}.${p2(n.getMinutes())}.${p2(n.getSeconds())}`;
       const path = await save({
-        defaultPath: `${stamp}.csv`,
-        filters: [{ name: 'CSV Files', extensions: ['csv'] }]
+        defaultPath: `${stamp}.ltlog`,
+        filters: [{ name: 'LibreTune Log', extensions: ['ltlog'] }]
       });
       
       if (path) {
@@ -517,26 +521,45 @@ export const DataLogView: React.FC = () => {
     try {
       const selected = await open({
         multiple: false,
-        filters: [{ name: 'Log Files', extensions: ['csv', 'msl', 'log'] }]
+        filters: [
+          { name: 'LibreTune Log', extensions: ['ltlog'] },
+          { name: 'Log Files', extensions: ['ltlog', 'csv', 'msl', 'mlg', 'log'] },
+        ]
       });
       
-      if (!selected) return;
-      
-      // Read and parse the file
-      const content = await invoke<string>('read_text_file', { path: selected });
-      const fileName = typeof selected === 'string' 
-        ? selected.split('/').pop() || selected.split('\\').pop() || 'log.csv'
-        : 'log.csv';
-      
-      const { data, channels } = parseLogCsv(content, fileName);
+      if (!selected || typeof selected !== 'string') return;
+
+      const fileName =
+        selected.split('/').pop() || selected.split('\\').pop() || 'log.ltlog';
+      const ext = fileName.toLowerCase().split('.').pop();
+
+      let data: { x: number; values: Record<string, number> }[] = [];
+      let channels: string[] = [];
+      let sampleCount = 0;
+
+      if (ext === 'ltlog' || ext === 'mlg') {
+        const loaded = await invoke<{
+          channels: string[];
+          samples: { x: number; values: Record<string, number> }[];
+          sample_count?: number;
+        }>('load_log_file', { path: selected });
+        data = loaded.samples;
+        channels = loaded.channels;
+        if (typeof loaded.sample_count === 'number') {
+          sampleCount = loaded.sample_count;
+        }
+      } else {
+        const content = await invoke<string>('read_file_contents', { path: selected });
+        const parsed = parseLogCsv(content, fileName);
+        data = parsed.data;
+        channels = parsed.channels;
+      }
       
       if (data.length === 0) {
-        // Previously this only reached the console, so picking an unreadable
-        // log looked like the button had done nothing at all.
         console.error('No valid data found in log file');
         setLoadError(
           `Could not read any data from "${fileName}". ` +
-          `Supported formats are TunerStudio .msl and comma-separated .csv logs.`
+          `Supported formats are LibreTune .ltlog, TunerStudio .msl/.mlg, and .csv logs.`
         );
         return;
       }
@@ -555,7 +578,7 @@ export const DataLogView: React.FC = () => {
       const duration = data.length > 0 ? data[data.length - 1].x - data[0].x : 0;
       setStatus({
         is_recording: false,
-        entry_count: data.length,
+        entry_count: sampleCount || data.length,
         duration_ms: duration,
         channels: channels
       });
@@ -614,21 +637,16 @@ export const DataLogView: React.FC = () => {
     };
   }, [viewMode, isPlaying, logData, playbackSpeed]);
   
-  // Get current playback values for display
-  const getCurrentPlaybackValues = useCallback((): Record<string, number> => {
+  // Get current playback values for display. Uses a binary search
+  // (nearestIndex, shared with GraphLog.tsx) over the time-sorted logData
+  // instead of an O(n) linear scan — this runs on every 50ms playback tick.
+  const currentPlaybackValues = useMemo<Record<string, number>>(() => {
     if (viewMode !== 'playback' || logData.length < 2) return {};
-    
+
     const currentTime = logData[0].x + playbackPosition * (logData[logData.length - 1].x - logData[0].x);
-    
-    // Find the closest data point
-    let closest = logData[0];
-    for (const point of logData) {
-      if (Math.abs(point.x - currentTime) < Math.abs(closest.x - currentTime)) {
-        closest = point;
-      }
-    }
-    
-    return closest.values;
+    const idx = nearestIndex(logData, currentTime, (d) => d.x);
+
+    return logData[idx].values;
   }, [viewMode, logData, playbackPosition]);
   
   const toggleChannel = useCallback((channel: string) => {
@@ -649,15 +667,28 @@ export const DataLogView: React.FC = () => {
   const liveValues = useChannels(selectedChannels);
 
   // Get display values - use playback or realtime based on mode
-  const displayValues = viewMode === 'playback' ? getCurrentPlaybackValues() : liveValues;
+  const displayValues = viewMode === 'playback' ? currentPlaybackValues : liveValues;
 
   // Samples for the Graph Log: the session log — growing while recording,
   // frozen after Stop, replaced by file data in playback, empty until the
   // first recording or after Clear.
-  const graphSamples = useMemo<GraphSample[]>(
-    () => logData.map((d) => ({ t: d.x, values: d.values })),
-    [logData],
-  );
+  //
+  // `logData` grows by appending (mergeEntries does `[...prev, ...fresh]`)
+  // every 200ms while recording, so remapping the whole array each tick would
+  // be O(session length) on every poll. incrementalMap only maps the newly
+  // appended tail and reuses the previously mapped prefix, falling back to a
+  // full remap when logData wasn't a simple append onto what we last saw
+  // (Clear, loading a file, refetch-with-new-channels, or the
+  // MAX_FRONTEND_SAMPLES cap trimming the front).
+  const graphSamplesCacheRef = useRef<IncrementalMapCache<{ x: number; values: Record<string, number> }, GraphSample>>({
+    source: [],
+    mapped: [],
+  });
+  const graphSamples = useMemo<GraphSample[]>(() => {
+    const next = incrementalMap(logData, graphSamplesCacheRef.current, (d) => ({ t: d.x, values: d.values }));
+    graphSamplesCacheRef.current = next;
+    return next.mapped;
+  }, [logData]);
   
   return (
     <div className="datalog-view">

@@ -294,11 +294,9 @@ export function Sidebar({ items, width, onResize, onItemSelect, searchIndex, pro
   }, []);
 
   const handleItemClick = useCallback((item: SidebarNode) => {
-    console.log('[Sidebar] handleItemClick called', { id: item.id, label: item.label, type: item.type, hasChildren: !!(item.children && item.children.length > 0) });
     if (item.children && item.children.length > 0) {
       toggleExpand(item.id);
     } else {
-      console.log('[Sidebar] Calling onItemSelect for leaf item', item);
       // Pass searchQuery as highlightTerm so the dialog can highlight matching fields
       onItemSelect(item, searchQuery.trim() || undefined);
     }
@@ -401,14 +399,14 @@ function TreeView({
 }: TreeViewProps) {
   return (
     <ul className="tree-list" role="tree">
-      {items.map((item) => {
+      {items.map((item, idx) => {
         const hasChildren = item.children && item.children.length > 0;
         const isExpanded = expandedIds.has(item.id);
         const isDisabled = item.disabled === true;
         const isSelected = !hasChildren && item.id === activeItemId;
 
         return (
-          <li key={item.id} className="tree-item" role="treeitem">
+          <li key={`${item.id}-${idx}`} className="tree-item" role="treeitem">
             <div
               className={`tree-item-row ${isDisabled ? 'tree-item-disabled' : ''} ${isSelected ? 'selected' : ''}`}
               aria-selected={isSelected}
